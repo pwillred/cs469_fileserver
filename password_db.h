@@ -18,7 +18,8 @@ enum {
     PASSWORD_DB_PASSWORD_MISMATCH = 6,
     PASSWORD_DB_CRYPTO_ERROR = 7,
     PASSWORD_DB_UNSUPPORTED_ALGORITHM = 8,
-    PASSWORD_DB_INVALID_RECORD = 9
+    PASSWORD_DB_INVALID_RECORD = 9,
+    PASSWORD_DB_STOPPED = 10
 };
 
 /*
@@ -74,6 +75,42 @@ int password_db_add_user(password_db_t *db, const char *username,
  */
 int password_db_verify_user(password_db_t *db, const char *username,
                             const char *password);
+
+/*
+ * Replace an existing user's credentials using the same input policy and KDF
+ * defaults as add_user. Generates a fresh salt, refreshes updated_at, and keeps
+ * id, username and created_at. Crypto completes before a single atomic UPDATE;
+ * failure leaves the existing record unchanged. No old password is required:
+ * this is a privileged administrative primitive, not an authentication API.
+ * Returns OK, INVALID_ARGUMENT, USER_NOT_FOUND, NO_MEMORY, SQLITE_ERROR or
+ * CRYPTO_ERROR. The caller owns and must clear new_password as appropriate.
+ */
+int password_db_change_password(password_db_t *db, const char *username,
+                                const char *new_password);
+
+/* Delete only the named database record (no filesystem operations). Username
+ * policy matches add_user. Returns OK, INVALID_ARGUMENT, USER_NOT_FOUND,
+ * NO_MEMORY or SQLITE_ERROR. A missing user is not treated as success.
+ */
+int password_db_delete_user(password_db_t *db, const char *username);
+
+typedef int (*password_db_user_callback)(const char *username, void *context);
+
+/*
+ * Enumerate usernames only, in ascending SQLite BINARY (case-sensitive) order.
+ * callback returns zero to continue; any nonzero value stops enumeration and
+ * returns PASSWORD_DB_STOPPED. An empty list returns OK without callbacks.
+ * username is borrowed, read-only, and valid only during that callback; copy it
+ * if needed later. context is passed through unchanged and may be NULL.
+ * Callbacks must not close/reenter this handle or mutate the database. A read
+ * transaction remains active during callbacks, so callbacks should be brief.
+ * NULL db/callback returns INVALID_ARGUMENT. Other results: OK, STOPPED,
+ * NO_MEMORY, SQLITE_ERROR or INVALID_RECORD for malformed stored usernames.
+ * On errors, earlier callbacks may already have run; their effects are not
+ * rolled back. No salts, hashes or KDF metadata are selected or returned.
+ */
+int password_db_list_users(password_db_t *db,
+                           password_db_user_callback callback, void *context);
 
 /* Release the connection and handle. NULL is a no-op; other handles are invalid
  * after this call. All operations using this handle must already have finished.

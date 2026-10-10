@@ -122,9 +122,8 @@ int password_db_init_schema(password_db_t *db) {
 }
 
 /* Bounded scans centralize the input policy without making password copies. */
-static int valid_inputs(password_db_t *db, const char *username,
-                        const char *password, int *password_length) {
-    if (db == NULL || username == NULL || password == NULL) {
+static int valid_username(const char *username) {
+    if (username == NULL) {
         return 0;
     }
     size_t i;
@@ -138,9 +137,15 @@ static int valid_inputs(password_db_t *db, const char *username,
             return 0;
         }
     }
-    if (i == 0 || i > PASSWORD_DB_USERNAME_MAX) {
+    return i > 0 && i <= PASSWORD_DB_USERNAME_MAX;
+}
+
+static int valid_inputs(password_db_t *db, const char *username,
+                        const char *password, int *password_length) {
+    if (db == NULL || !valid_username(username) || password == NULL) {
         return 0;
     }
+    size_t i;
     for (i = 0; i <= PASSWORD_DB_PASSWORD_MAX && password[i] != '\0'; ++i) {
     }
     if (i == 0 || i > PASSWORD_DB_PASSWORD_MAX) {
@@ -165,8 +170,24 @@ static int finish_statement(sqlite3_stmt *stmt, int result) {
     return result;
 }
 
-int password_db_add_user(password_db_t *db, const char *username,
-                         const char *password) {
+/* Use SQLite's existing recursive connection mutex to keep step + changes
+ * together. Otherwise another thread using this handle could overwrite the
+ * connection-wide change count between those calls. No new mutex is allocated.
+ */
+static int step_mutation(password_db_t *db, sqlite3_stmt *stmt, int *changed) {
+    sqlite3_mutex *mutex = sqlite3_db_mutex(db->connection);
+    sqlite3_mutex_enter(mutex);
+    int rc = sqlite3_step(stmt);
+    *changed = rc == SQLITE_DONE ? sqlite3_changes(db->connection) : 0;
+    sqlite3_mutex_leave(mutex);
+    return rc;
+}
+
+/* Insertion and password replacement share validation, salt generation, KDF,
+ * bindings and cleansing; only the atomic SQL mutation differs.
+ */
+static int store_password(password_db_t *db, const char *username,
+                           const char *password, int replace) {
     int password_length;
     if (!valid_inputs(db, username, password, &password_length)) {
         return PASSWORD_DB_INVALID_ARGUMENT;
@@ -182,9 +203,13 @@ int password_db_add_user(password_db_t *db, const char *username,
         goto cleanup;
     }
 
-    int rc = sqlite3_prepare_v2(db->connection,
-        "INSERT INTO users(username,salt,password_hash,algorithm,iterations) "
-        "VALUES(?1,?2,?3,?4,?5)", -1, &stmt, NULL);
+    const char *sql = replace
+        ? "UPDATE users SET salt=?2,password_hash=?3,algorithm=?4,iterations=?5,"
+          "updated_at=CURRENT_TIMESTAMP WHERE username=?1"
+        : "INSERT INTO users(username,salt,password_hash,algorithm,iterations) "
+          "VALUES(?1,?2,?3,?4,?5)";
+    int changed = 0;
+    int rc = sqlite3_prepare_v2(db->connection, sql, -1, &stmt, NULL);
     if (rc == SQLITE_OK) {
         rc = sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
     }
@@ -201,10 +226,14 @@ int password_db_add_user(password_db_t *db, const char *username,
         rc = sqlite3_bind_int(stmt, 5, PASSWORD_DB_PBKDF2_ITERATIONS);
     }
     if (rc == SQLITE_OK) {
-        rc = sqlite3_step(stmt);
+        rc = step_mutation(db, stmt, &changed);
     }
-    result = rc == SQLITE_DONE ? PASSWORD_DB_OK :
-        rc == SQLITE_CONSTRAINT_UNIQUE ? PASSWORD_DB_USER_EXISTS : database_result(rc);
+    if (rc == SQLITE_DONE) {
+        result = replace && changed == 0 ? PASSWORD_DB_USER_NOT_FOUND : PASSWORD_DB_OK;
+    } else {
+        result = !replace && rc == SQLITE_CONSTRAINT_UNIQUE
+            ? PASSWORD_DB_USER_EXISTS : database_result(rc);
+    }
 
 cleanup:
     /* STATIC bindings avoid extra key copies and remain valid until finalized. */
@@ -212,6 +241,74 @@ cleanup:
     OPENSSL_cleanse(key, sizeof(key));
     OPENSSL_cleanse(salt, sizeof(salt));
     return result;
+}
+
+int password_db_add_user(password_db_t *db, const char *username,
+                         const char *password) {
+    return store_password(db, username, password, 0);
+}
+
+int password_db_change_password(password_db_t *db, const char *username,
+                                const char *new_password) {
+    return store_password(db, username, new_password, 1);
+}
+
+int password_db_delete_user(password_db_t *db, const char *username) {
+    if (db == NULL || !valid_username(username)) {
+        return PASSWORD_DB_INVALID_ARGUMENT;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int changed = 0;
+    int rc = sqlite3_prepare_v2(db->connection,
+        "DELETE FROM users WHERE username=?1", -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_bind_text(stmt, 1, username, -1, SQLITE_STATIC);
+    }
+    if (rc == SQLITE_OK) {
+        rc = step_mutation(db, stmt, &changed);
+    }
+    int result = rc == SQLITE_DONE
+        ? (changed == 0 ? PASSWORD_DB_USER_NOT_FOUND : PASSWORD_DB_OK)
+        : database_result(rc);
+    return finish_statement(stmt, result);
+}
+
+int password_db_list_users(password_db_t *db,
+                           password_db_user_callback callback, void *context) {
+    if (db == NULL || callback == NULL) {
+        return PASSWORD_DB_INVALID_ARGUMENT;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->connection,
+        "SELECT username FROM users ORDER BY username COLLATE BINARY", -1, &stmt, NULL);
+    int result = PASSWORD_DB_OK;
+    if (rc != SQLITE_OK) {
+        return finish_statement(stmt, database_result(rc));
+    }
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (sqlite3_column_type(stmt, 0) != SQLITE_TEXT) {
+            result = PASSWORD_DB_INVALID_RECORD;
+            break;
+        }
+        const char *username = (const char *)sqlite3_column_text(stmt, 0);
+        if (username == NULL) {
+            result = PASSWORD_DB_NO_MEMORY;
+            break;
+        }
+        if (!valid_username(username) ||
+            (size_t)sqlite3_column_bytes(stmt, 0) != strlen(username)) {
+            result = PASSWORD_DB_INVALID_RECORD;
+            break;
+        }
+        if (callback(username, context) != 0) {
+            result = PASSWORD_DB_STOPPED;
+            break;
+        }
+    }
+    if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
+        result = database_result(rc);
+    }
+    return finish_statement(stmt, result);
 }
 
 int password_db_verify_user(password_db_t *db, const char *username,

@@ -187,6 +187,179 @@ cleanup:
     return result;
 }
 
+
+/* Copy borrowed callback names so their contents can be checked after return. */
+struct user_list {
+    char names[8][65];
+    size_t count;
+    int stop;
+};
+
+static int collect_user(const char *username, void *context) {
+    struct user_list *list = context;
+    if (list->count >= 8 || strlen(username) >= sizeof(list->names[0])) {
+        return -1;
+    }
+    strcpy(list->names[list->count++], username);
+    return list->stop;
+}
+
+static int stop_without_context(const char *username, void *context) {
+    return username != NULL && context == NULL ? 1 : 0;
+}
+
+static int test_management(const char *path, sqlite3 *inspection) {
+    password_db_t *first = NULL;
+    password_db_t *second = NULL;
+    sqlite3_stmt *stmt = NULL;
+    unsigned char salt[16] = {7};
+    unsigned char hash[32] = {0};
+    struct user_list list = {0};
+    int count = 0;
+    int result = EXIT_FAILURE;
+    char too_long[4098];
+    memset(too_long, 'p', sizeof(too_long) - 1);
+    too_long[sizeof(too_long) - 1] = '\0';
+    CHECK(password_db_open(path, &first) == PASSWORD_DB_OK);
+    CHECK(password_db_open(path, &second) == PASSWORD_DB_OK);
+    CHECK(sqlite3_exec(inspection, "DELETE FROM users", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(password_db_list_users(first, collect_user, &list) == PASSWORD_DB_OK);
+    CHECK(list.count == 0);
+    CHECK(password_db_list_users(NULL, collect_user, &list) == PASSWORD_DB_INVALID_ARGUMENT);
+    CHECK(password_db_list_users(first, NULL, NULL) == PASSWORD_DB_INVALID_ARGUMENT);
+    CHECK(password_db_list_users(first, stop_without_context, NULL) == PASSWORD_DB_OK);
+    CHECK(password_db_add_user(first, "bob", "original") == PASSWORD_DB_OK);
+    CHECK(password_db_list_users(second, collect_user, &list) == PASSWORD_DB_OK);
+    CHECK(list.count == 1 && strcmp(list.names[0], "bob") == 0);
+    CHECK(password_db_add_user(second, "zoe", "other") == PASSWORD_DB_OK);
+    CHECK(password_db_add_user(first, "Alice", "other") == PASSWORD_DB_OK);
+    list = (struct user_list){0};
+    CHECK(password_db_list_users(second, collect_user, &list) == PASSWORD_DB_OK);
+    CHECK(list.count == 3 && strcmp(list.names[0], "Alice") == 0 &&
+        strcmp(list.names[1], "bob") == 0 && strcmp(list.names[2], "zoe") == 0);
+    list = (struct user_list){.stop = -7};
+    CHECK(password_db_list_users(first, collect_user, &list) == PASSWORD_DB_STOPPED);
+    CHECK(list.count == 1 && strcmp(list.names[0], "Alice") == 0);
+    CHECK(password_db_list_users(first, stop_without_context, NULL) == PASSWORD_DB_STOPPED);
+    /* A second connection can write after early termination: no read lock leaks. */
+    CHECK(password_db_add_user(second, "temporary", "other") == PASSWORD_DB_OK);
+    CHECK(password_db_delete_user(second, "temporary") == PASSWORD_DB_OK);
+    puts("PASS: empty/single/ordered username-only lists, callbacks and early-stop cleanup");
+
+    const char *invalid[] = {"", ".", "..", "a/b", "a\\b", "a b", "x'--", too_long};
+    CHECK(password_db_change_password(NULL, "bob", "new") == PASSWORD_DB_INVALID_ARGUMENT);
+    CHECK(password_db_change_password(first, NULL, "new") == PASSWORD_DB_INVALID_ARGUMENT);
+    CHECK(password_db_change_password(first, "bob", NULL) == PASSWORD_DB_INVALID_ARGUMENT);
+    CHECK(password_db_change_password(first, "bob", "") == PASSWORD_DB_INVALID_ARGUMENT);
+    CHECK(password_db_change_password(first, "bob", too_long) == PASSWORD_DB_INVALID_ARGUMENT);
+    CHECK(password_db_delete_user(NULL, "bob") == PASSWORD_DB_INVALID_ARGUMENT);
+    CHECK(password_db_delete_user(first, NULL) == PASSWORD_DB_INVALID_ARGUMENT);
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        CHECK(password_db_change_password(first, invalid[i], "new") == PASSWORD_DB_INVALID_ARGUMENT);
+        CHECK(password_db_delete_user(first, invalid[i]) == PASSWORD_DB_INVALID_ARGUMENT);
+    }
+    CHECK(password_db_change_password(first, "missing", "new") == PASSWORD_DB_USER_NOT_FOUND);
+    CHECK(password_db_verify_user(first, "bob", "original") == PASSWORD_DB_OK);
+    puts("PASS: management input validation, unknown user and rejected-change preservation");
+
+    /* Supply a valid legacy-cost credential and deterministic timestamp values.
+     * Password change must upgrade cost, retain identity and refresh only updated_at.
+     */
+    CHECK(PKCS5_PBKDF2_HMAC("original", 8, salt, sizeof(salt), 12345,
+        EVP_sha256(), sizeof(hash), hash) == 1);
+    CHECK(sqlite3_prepare_v2(inspection,
+        "UPDATE users SET salt=?1,password_hash=?2,iterations=12345,"
+        "created_at='2000-01-01 00:00:00',updated_at='2001-01-01 00:00:00' WHERE username='bob'",
+        -1, &stmt, NULL) == SQLITE_OK);
+    CHECK(sqlite3_bind_blob(stmt, 1, salt, sizeof(salt), SQLITE_STATIC) == SQLITE_OK);
+    CHECK(sqlite3_bind_blob(stmt, 2, hash, sizeof(hash), SQLITE_STATIC) == SQLITE_OK);
+    CHECK(sqlite3_step(stmt) == SQLITE_DONE);
+    int rc = sqlite3_finalize(stmt);
+    stmt = NULL;
+    CHECK(rc == SQLITE_OK);
+    CHECK(password_db_verify_user(second, "bob", "original") == PASSWORD_DB_OK);
+    CHECK(sqlite3_exec(inspection, "CREATE TEMP TABLE before_change AS SELECT * FROM users WHERE username='bob'",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(password_db_change_password(first, "bob", "replacement") == PASSWORD_DB_OK);
+    CHECK(password_db_verify_user(second, "bob", "original") == PASSWORD_DB_PASSWORD_MISMATCH);
+    CHECK(password_db_verify_user(second, "bob", "replacement") == PASSWORD_DB_OK);
+    CHECK(query_int(inspection,
+        "SELECT count(*) FROM users u JOIN before_change b ON u.id=b.id WHERE u.username=b.username "
+        "AND u.created_at=b.created_at AND u.salt<>b.salt AND u.password_hash<>b.password_hash "
+        "AND length(u.salt)=16 AND length(u.password_hash)=32 "
+        "AND u.algorithm='PBKDF2-HMAC-SHA256' AND u.iterations=600000 "
+        "AND u.updated_at<>b.updated_at AND datetime(u.updated_at) IS NOT NULL "
+        "AND u.updated_at>='2001-01-01 00:00:00' AND u.updated_at<=CURRENT_TIMESTAMP",
+        &count) == SQLITE_OK);
+    CHECK(count == 1);
+    puts("PASS: password replacement, fresh salt/hash, default KDF, identity and timestamps");
+
+    CHECK(sqlite3_exec(inspection,
+        "DELETE FROM before_change; INSERT INTO before_change SELECT * FROM users WHERE username='bob';"
+        "CREATE TRIGGER reject_change BEFORE UPDATE ON users BEGIN SELECT RAISE(ABORT,'forced'); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(password_db_change_password(first, "bob", "rejected") == PASSWORD_DB_SQLITE_ERROR);
+    CHECK(password_db_verify_user(second, "bob", "replacement") == PASSWORD_DB_OK);
+    CHECK(password_db_verify_user(second, "bob", "rejected") == PASSWORD_DB_PASSWORD_MISMATCH);
+    CHECK(query_int(inspection,
+        "SELECT count(*) FROM (SELECT * FROM users WHERE username='bob' INTERSECT SELECT * FROM before_change)",
+        &count) == SQLITE_OK);
+    CHECK(count == 1);
+    CHECK(sqlite3_exec(inspection, "DROP TRIGGER reject_change; DROP TABLE before_change;"
+        "CREATE TRIGGER reject_delete BEFORE DELETE ON users BEGIN SELECT RAISE(ABORT,'forced'); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(password_db_delete_user(first, "zoe") == PASSWORD_DB_SQLITE_ERROR);
+    CHECK(password_db_verify_user(second, "zoe", "other") == PASSWORD_DB_OK);
+    CHECK(sqlite3_exec(inspection, "DROP TRIGGER reject_delete", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(password_db_delete_user(first, "zoe") == PASSWORD_DB_OK);
+    CHECK(password_db_verify_user(second, "zoe", "other") == PASSWORD_DB_USER_NOT_FOUND);
+    CHECK(password_db_delete_user(second, "zoe") == PASSWORD_DB_USER_NOT_FOUND);
+    CHECK(password_db_verify_user(second, "Alice", "other") == PASSWORD_DB_OK);
+    CHECK(password_db_verify_user(second, "bob", "replacement") == PASSWORD_DB_OK);
+    puts("PASS: forced SQL failure atomicity, delete isolation and statement cleanup");
+
+    password_db_close(first);
+    first = NULL;
+    password_db_close(second);
+    second = NULL;
+    CHECK(password_db_open(path, &first) == PASSWORD_DB_OK);
+    CHECK(password_db_open(path, &second) == PASSWORD_DB_OK);
+    CHECK(password_db_verify_user(first, "bob", "replacement") == PASSWORD_DB_OK);
+    CHECK(password_db_verify_user(first, "bob", "original") == PASSWORD_DB_PASSWORD_MISMATCH);
+    CHECK(password_db_verify_user(second, "zoe", "other") == PASSWORD_DB_USER_NOT_FOUND);
+    list = (struct user_list){0};
+    CHECK(password_db_list_users(second, collect_user, &list) == PASSWORD_DB_OK);
+    CHECK(list.count == 2 && strcmp(list.names[0], "Alice") == 0 && strcmp(list.names[1], "bob") == 0);
+    puts("PASS: change/delete/list persistence and visibility through independent handles");
+
+    CHECK(sqlite3_exec(inspection, "DROP TABLE users", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(password_db_change_password(first, "bob", "new") == PASSWORD_DB_SQLITE_ERROR);
+    CHECK(password_db_delete_user(first, "bob") == PASSWORD_DB_SQLITE_ERROR);
+    list = (struct user_list){0};
+    CHECK(password_db_list_users(first, collect_user, &list) == PASSWORD_DB_SQLITE_ERROR);
+    CHECK(list.count == 0);
+    CHECK(password_db_init_schema(second) == PASSWORD_DB_OK);
+    CHECK(password_db_add_user(second, "recovered", "original") == PASSWORD_DB_OK);
+    CHECK(password_db_change_password(first, "recovered", "new") == PASSWORD_DB_OK);
+    CHECK(password_db_verify_user(second, "recovered", "new") == PASSWORD_DB_OK);
+    CHECK(password_db_delete_user(first, "recovered") == PASSWORD_DB_OK);
+    CHECK(password_db_list_users(second, collect_user, &list) == PASSWORD_DB_OK);
+    CHECK(list.count == 0);
+    puts("PASS: missing-schema errors and recovery for all management APIs");
+    result = EXIT_SUCCESS;
+
+cleanup:
+    if (sqlite3_finalize(stmt) != SQLITE_OK) {
+        result = EXIT_FAILURE;
+    }
+    OPENSSL_cleanse(hash, sizeof(hash));
+    OPENSSL_cleanse(salt, sizeof(salt));
+    OPENSSL_cleanse(too_long, sizeof(too_long));
+    password_db_close(first);
+    password_db_close(second);
+    return result;
+}
+
 int main(void) {
     char directory[] = "/tmp/cs469-password-db-XXXXXX";
     char path[256] = {0};
@@ -288,6 +461,7 @@ int main(void) {
     CHECK(password_db_init_schema(second) == PASSWORD_DB_OK);
     puts("PASS: schema failure and recovery on the same handle");
     CHECK(test_passwords(path, inspection) == EXIT_SUCCESS);
+    CHECK(test_management(path, inspection) == EXIT_SUCCESS);
     result = EXIT_SUCCESS;
 
 cleanup:
