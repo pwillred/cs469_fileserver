@@ -2,8 +2,8 @@
 
 This is the team's working client integration contract, not an instructor-provided
 specification. Changes require coordination between client/read/authentication
-work and server/protocol/replicated-write coordination. Transport primitives do
-not implement these messages yet.
+work and server/protocol/replicated-write coordination. The client codec and
+commands implement these messages; the transport module remains byte-oriented.
 
 ## Transport and authentication
 
@@ -26,9 +26,10 @@ plus NUL; filename at most 256 characters plus NUL. Integers are big-endian.
 Status occupies exactly one byte. The operation layouts below preserve the
 frozen request shapes.
 
-The existing local password prompt accepts up to 4096 bytes. Future request
-encoding must reject credentials that exceed the 64-character wire limit or
-violate ASCII requirements; it must never truncate them silently.
+The local password prompt accepts up to 4096 bytes. Client request validation
+rejects credentials above the 64-character wire limit before connecting. Client
+strings must be nonempty printable ASCII; filenames also exclude path separators,
+`.` and `..`. Values are never truncated.
 
 | Byte | Status |
 | --- | --- |
@@ -72,7 +73,8 @@ connection/transport unavailability. UPLOAD/DELETE always use the primary and
 never fail over. Certificate/identity failures and invalid trust configuration
 must fail closed, not trigger failover. All application status responses above
 are **not failover triggers**. Future callers must track response/transfer progress
-before deciding whether a read can safely restart. No retry/failover exists yet.
+before deciding whether a read can safely restart. All current client commands
+connect to the primary only; no retry/failover exists yet.
 
 ## Ownership boundary
 

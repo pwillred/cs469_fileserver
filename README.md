@@ -3,10 +3,11 @@
 A CS469 Distributed Systems project at Regis University by Fedil Grogan and
 Brian Leake. The target is a secure file service with a CLI client, a primary
 server, and a read-only replica. **The distributed service is not complete:**
-local credential administration and client configuration/password input work;
-server authentication, read operations, replication, and client command networking
-are not integrated in this checkout. Verified TLS transport primitives are available
-separately and tested with local fixtures.
+local credential administration and the primary-only client are implemented.
+The client executes LIST/UPLOAD/DOWNLOAD/DELETE over verified TLS against the
+frozen working contract, tested with local mock servers. Server authentication,
+read operations, replication, read failover, and final client/server integration
+remain pending. The current server scaffold is not wire-compatible with the client.
 
 ## Project Overview
 
@@ -61,9 +62,9 @@ password command-line arguments are deliberately prohibited.
 The server loads a TLS certificate/key, but real user authentication and per-user
 isolation still need integration. The reusable client transport verifies CA trust
 and DNS/IP identity with TLS 1.2 or newer. Primary-to-replica mTLS remains planned.
-The CA configuration key currently records a path
-only; the CLI does not connect yet. The transport API loads that CA when explicitly
-called. There is no insecure client mode.
+The configuration loader records the CA path; command execution loads that CA
+and verifies the primary before transmitting credentials. There is no insecure
+client mode or automatic retry.
 
 ## Repository Layout
 
@@ -71,10 +72,12 @@ called. There is no insecure client mode.
 | --- | --- |
 | `admin.c` | Local account administration |
 | `password_db.c`, `password_db.h` | SQLite lifecycle, hashing, verification, account management |
-| `client.c` | Local CLI entry point; prompts then discards password |
+| `client.c` | CLI orchestration, secure prompt, command results |
 | `client_config.c`, `client_config.h` | CLI parsing and deployment configuration loading |
 | `client.conf.example` | Placeholder topology and CA configuration |
 | `client_password.c`, `client_password.h` | Secure single-password terminal input |
+| `client_protocol.c`, `client_protocol.h` | Independent client wire codec, validation and status decoding |
+| `client_commands.c`, `client_commands.h` | Primary-only commands, streaming, safe downloads and password cleanup |
 | `client_transport.c`, `client_transport.h` | Verified TCP/TLS connection and exact I/O primitives |
 | `INTEGRATION_ASSUMPTIONS.md` | Working wire contract and current scaffold conflicts |
 | `server.c`, `server.h` | TLS/TCP startup, configuration, detached connection threads |
@@ -86,6 +89,9 @@ called. There is no insecure client mode.
 | `tests/test_client_config.c` | CLI and configuration-file tests |
 | `tests/test_client_password.c` | Pseudo-terminal password/cleanup tests |
 | `tests/test_client_transport.c` | Loopback TLS, trust, identity, I/O and cleanup tests |
+| `tests/test_client_protocol.c` | Exact wire bytes and boundary tests using an in-memory transport |
+| `tests/test_client_commands.c`, `tests/client_io_faults.h` | Password-erasure runner and test-only local I/O fault injection |
+| `tests/test_client_integration.py` | TLS mock servers and actual executable/PTY tests |
 | `Makefile`, `.gitignore` | Server build and C artifact ignores |
 
 ## Dependencies
@@ -94,8 +100,8 @@ Use a C compiler, a POSIX environment, pthreads, OpenSSL development headers and
 libraries, SQLite3 development headers/libraries, and `make`. Password terminal
 tests also use `openpty`/libutil. macOS needs Command Line Tools; Homebrew OpenSSL
 may require explicit include/library paths. The direct builds below were checked
-on macOS; Linux requires the corresponding development packages. Python 3 is not
-needed for the checked-in C test suites.
+on macOS; Linux requires the corresponding development packages. The command
+integration suite additionally requires Python 3 and the `openssl` CLI.
 
 ## Building
 
@@ -116,7 +122,8 @@ CFLAGS="-std=c11 -Wall -Wextra -Wpedantic"
 cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
   -o "$BUILD_DIR/admin" admin.c password_db.c -lsqlite3 -lcrypto
 cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
-  -o "$BUILD_DIR/client" client.c client_config.c client_password.c -lcrypto
+  -o "$BUILD_DIR/client" client.c client_config.c client_password.c \
+  client_commands.c client_protocol.c client_transport.c -lssl -lcrypto -lpthread
 cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
   -o "$BUILD_DIR/test_password_db" tests/test_password_db.c password_db.c -lsqlite3 -lcrypto
 cc $CFLAGS -o "$BUILD_DIR/test_client_config" tests/test_client_config.c client_config.c
@@ -124,6 +131,15 @@ cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
   -o "$BUILD_DIR/test_client_password" tests/test_client_password.c client_password.c -lcrypto -lutil
 cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
   -o "$BUILD_DIR/test_client_transport" tests/test_client_transport.c client_transport.c -lssl -lcrypto -lpthread
+cc $CFLAGS -o "$BUILD_DIR/test_client_protocol" tests/test_client_protocol.c client_protocol.c
+# Fault substitution is confined to this test object; production builds use POSIX I/O.
+cc $CFLAGS $OPENSSL_CFLAGS -include tests/client_io_faults.h \
+  -Dread=client_test_read -Dwrite=client_test_write \
+  -c client_commands.c -o "$BUILD_DIR/test_commands.o"
+cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
+  -o "$BUILD_DIR/test_client_commands" tests/test_client_commands.c \
+  "$BUILD_DIR/test_commands.o" client_config.c client_protocol.c client_transport.c \
+  -lssl -lcrypto -lpthread
 ```
 
 The existing Makefile builds **only `server`**; it has no admin, client or test
@@ -212,8 +228,9 @@ directory, not the configuration file. The loader does not open the CA file.
 `--primary-host`, `--primary-port`, `--replica-host`, `--replica-port`, and `--ca`
 CLI options are rejected, as are password options. The client internally retains
 both endpoints. Future LIST/DOWNLOAD failover will be automatic for eligible
-availability failures; UPLOAD/DELETE remain primary-only. Routing, networking and
-failover are still pending. Command operands are:
+availability failures; UPLOAD/DELETE remain primary-only. **All four commands
+currently connect only to the primary, once, without retry or failover.**
+Command operands are:
 
 ```text
 list
@@ -222,17 +239,38 @@ download REMOTE_NAME LOCAL_FILE
 delete REMOTE_NAME
 ```
 
-Local paths must be nonempty; remote names must be nonempty filenames without
-path separators and cannot be `.` or `..`. Only the configuration file is read;
-no user files are opened or transferred. Use `client --help` for usage.
+Local paths must be nonempty. Username/password must contain 1–64 printable ASCII
+characters. Remote names must contain 1–256 printable ASCII characters, cannot
+contain either path separator, and cannot be `.` or `..`. Invalid values are
+rejected locally, never truncated. Use `client --help` for usage.
 
-After valid parsing and configuration loading, the client prompts **once**,
-without confirmation, using terminal stdin. It accepts up to 4096 bytes locally, rejects empty/overlong input,
-clears the password immediately, and reports that no network operation occurred.
-Help, invalid arguments, and missing/invalid configuration never prompt.
-Noninteractive password input is rejected.
-The final wire password limit remains unresolved; this local limit does not
-change the scaffold's 64-byte protocol constant. Input is never silently truncated.
+After valid parsing and configuration loading, the client prompts **once** using
+terminal stdin, without confirmation or echo. The local prompt permits up to
+4096 bytes, but command execution rejects passwords over the 64-character wire
+limit **before connecting**. The entire password buffer is cleansed after every
+command result and every prompt failure. Help, invalid arguments, and invalid
+configuration never prompt. Noninteractive password input is rejected.
+
+LIST prints one filename per line; an empty list prints nothing. Response counts
+are capped at 10,000 entries, and each name must terminate within 257 bytes and
+pass filename validation. A malformed later entry can leave earlier entries on
+stdout; the command still exits unsuccessfully.
+
+UPLOAD opens a regular local file read-only, rejects sizes above UINT32_MAX,
+waits for preliminary OK, streams exactly the measured size in chunks of at most
+16 KiB, and succeeds only on final OK. A shrinking file fails; growth beyond the
+measured size is not transmitted. No snapshot of concurrent source edits is made.
+DOWNLOAD streams to a private (0600), randomly named temporary sibling, then
+fsyncs/closes it and publishes only after receiving all advertised bytes. Existing
+destinations, including symlinks and files created during transfer, are rejected.
+Publication uses atomic POSIX `linkat` followed by removal of the staging name:
+unlike ordinary `rename`, this cannot overwrite a destination. The destination
+filesystem must support hard links. Handled failures remove staging files; process
+crashes or filesystem cleanup failures can leave a staging file, never a partial
+final file. Directory entries are not fsynced for crash durability.
+Zero-byte uploads/downloads work. Successful writes/downloads print a concise
+completion message; errors go to stderr with a nonzero exit code. An interrupted
+upload/delete can have an unknown remote outcome and is never automatically retried.
 
 ## Current Implementation Status
 
@@ -241,15 +279,15 @@ change the scaffold's 64-byte protocol constant. Input is never silently truncat
 | Password DB and account APIs | Implemented and tested locally |
 | Admin CLI | Implemented; local administration only |
 | Client CLI/configuration | Implemented and tested |
-| Client secure password input | Implemented and tested; no credentials sent |
+| Client secure password input | Implemented; credentials sent only inside verified TLS |
 | Server TLS/thread scaffold | Present; lifecycle/I/O hardening pending |
 | Server authentication | Always-success stub; DB integration pending |
-| LIST / DOWNLOAD | Success-returning stubs; no file data returned |
-| UPLOAD / DELETE | Local filesystem paths only |
+| Server LIST / DOWNLOAD | Success-returning stubs; no file data returned |
+| Server UPLOAD / DELETE | Local filesystem paths only |
 | Replication / prepare-commit / mTLS | Not implemented in this checkout |
 | Primary/replica role enforcement | Pending |
 | Client TLS transport primitives | Implemented separately; verified connections and exact I/O |
-| Client file-service command execution | Pending; CLI still does not connect |
+| Client codec and LIST / UPLOAD / DOWNLOAD / DELETE | Implemented against frozen contract; local TLS mock tests |
 | Read failover | Pending |
 
 ## Testing
@@ -261,6 +299,8 @@ After the direct builds above:
 "$BUILD_DIR/test_client_config"
 "$BUILD_DIR/test_client_password"
 "$BUILD_DIR/test_client_transport"
+"$BUILD_DIR/test_client_protocol"
+python3 tests/test_client_integration.py "$BUILD_DIR/client" "$BUILD_DIR/test_client_commands"
 ```
 
 The database suite creates and removes temporary databases. Configuration tests
@@ -276,23 +316,33 @@ identity, SNI, buffered/fragmented reads, large writes, EOF and timeouts. A genu
 partial SSL_write return is not deterministically forced; large multi-write
 payloads cover progress. IPv6 support is implemented but the fixture binds IPv4.
 
+The protocol suite checks exact byte layouts and boundaries without a socket.
+The integration suite generates temporary CA/server keys and certificates and
+checks actual TLS requests, preliminary/final statuses, streaming, malformed
+responses, local read/write faults, no-overwrite races and cleanup. Its command
+runner verifies the entire password allocation is zero after each case; a PTY
+also exercises the actual executable for all four commands and selected failures.
+A replica listener and primary pending-connection checks detect unwanted retries.
+No partner server or external service is needed; temporary fixtures are removed.
+
 For AddressSanitizer/UndefinedBehaviorSanitizer, append
 `-fsanitize=address,undefined -fno-omit-frame-pointer` to `CFLAGS`, rebuild the desired
 tools/tests with the same commands, and rerun them. No live server is required.
 
 ## Known Limitations / Work in Progress
 
-- Final wire framing, string termination and read-response formats need agreement.
+- Client wire behavior follows the frozen working contract; the stale server scaffold
+  needs coordinated changes before integration.
 - Server credential parsing is not yet safe to connect directly to the database API.
 - Replication, role enforcement, final authentication and failover remain incomplete.
 - Credential provisioning is manual on each node; no credential replication exists.
-- The CLI still performs no networking or password verification; TLS primitives
-  are available to future command code but are not invoked by the CLI.
+- Client commands are validated against mock TLS servers, not the current scaffold.
+  A successful mock result does not establish deployed replication or authentication.
 - Transport uses one 5-second deadline for TCP attempts plus TLS handshake after
   resolution, and one deadline per read/write call; a timeout API permits overrides.
   Synchronous getaddrinfo is not deadline-bounded. Close makes one nonblocking
   close_notify attempt. Callers must discard a connection after transfer failure.
-- No automatic replica routing or command serialization is implemented. See
+- No automatic replica routing or retries are implemented. See
   INTEGRATION_ASSUMPTIONS.md for the working contract and scaffold conflicts.
 - Password entry uses terminal editing conventions: backspace edits, Ctrl-U clears,
   Ctrl-D cancels. Signal controls and flow control retain terminal meanings.
