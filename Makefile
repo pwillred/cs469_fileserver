@@ -43,7 +43,7 @@ TEST_DIR := $(BUILD_DIR)/tests
 
 TEST_TARGETS := test-password-db test-client-config test-client-password \
  test-client-transport test-client-protocol test-client-commands \
- test-client-failover test-server-auth test-server-auth-faults
+ test-client-failover test-server-auth test-server-auth-faults test-server-read
 
 .PHONY: all clean test check sanitize help $(TEST_TARGETS) test-client-integration
 all: $(SERVER) $(CLIENT) $(ADMIN)
@@ -110,6 +110,19 @@ test-server-auth: $(TEST_DIR)/test_server_auth
 	./$<
 test-server-auth-faults: $(TEST_DIR)/test_server_auth_faults
 	./$<
+
+
+$(TEST_DIR)/server_read_ops_faults.o: server_read_ops.c tests/server_read_faults.h Makefile
+	@mkdir -p "$(@D)"
+	$(CC) $(CPPFLAGS) $(PROJECT_CPPFLAGS) $(CFLAGS) $(SANITIZER_FLAGS) -MMD -MP \
+	  -include tests/server_read_faults.h -Dread=read_test_read -DOPENSSL_cleanse=read_test_cleanse -c $< -o $@
+$(TEST_DIR)/test_server_read_ops: $(TEST_DIR)/test_server_read_ops.o $(TEST_DIR)/server_read_ops_faults.o $(BUILD_DIR)/server_auth.o $(BUILD_DIR)/password_db.o
+	$(CC) $(CFLAGS) $(SANITIZER_FLAGS) $(LDFLAGS) $(OPENSSL_LDFLAGS) -o $@ $^ $(SQLITE_LIBS) $(CRYPTO_LIBS) $(LDLIBS)
+$(TEST_DIR)/server_read_fixture: $(TEST_DIR)/server_read_fixture.o $(BUILD_DIR)/server_read_ops.o $(BUILD_DIR)/server_protocol_io.o $(BUILD_DIR)/server_auth.o $(BUILD_DIR)/password_db.o
+	$(CC) $(CFLAGS) $(SANITIZER_FLAGS) $(LDFLAGS) $(OPENSSL_LDFLAGS) -o $@ $^ $(SQLITE_LIBS) $(SSL_LIBS) $(THREAD_LIBS) $(LDLIBS)
+test-server-read: $(TEST_DIR)/test_server_read_ops $(TEST_DIR)/server_read_fixture $(CLIENT)
+	./$(TEST_DIR)/test_server_read_ops
+	$(PYTHON) tests/test_server_read_integration.py $(TEST_DIR)/server_read_fixture ./$(CLIENT)
 
 test: $(TEST_TARGETS)
 check: test

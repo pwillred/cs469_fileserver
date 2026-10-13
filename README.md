@@ -4,10 +4,10 @@ A CS469 Distributed Systems project at Regis University by Fedil Grogan and
 Brian Leake. The target is a secure file service with a CLI client, a primary
 server, and a read-only replica. **The distributed service is not complete:**
 local credential administration, client commands, client read failover, and an
-isolated server authentication module are implemented.
+isolated server authentication and LIST/DOWNLOAD handlers are implemented.
 The client executes LIST/UPLOAD/DOWNLOAD/DELETE over verified TLS against the
 frozen working contract, tested with local mock servers. Server authentication wiring,
-read operations, replication, and final client/server integration
+production read dispatch, replication, and final client/server integration
 remain pending. The current server scaffold is not wire-compatible with the client.
 
 ## Project Overview
@@ -83,7 +83,11 @@ failures never trigger failover. There is no insecure client mode or general ret
 | `INTEGRATION_ASSUMPTIONS.md` | Working wire contract and current scaffold conflicts |
 | `server.c`, `server.h` | TLS/TCP startup, configuration, detached connection threads |
 | `server_ops.c` | Dispatch, local writes, authentication/read stubs |
-| `server_auth.c`, `server_auth.h` | Isolated decoded-credential validation, DB verification and error mapping; not wired to handlers |
+| `server_auth.c`, `server_auth.h` | Decoded-credential validation, DB verification and error mapping, used by isolated read handlers |
+| `server_read_ops.c`, `server_read_ops.h` | Isolated authenticated LIST/DOWNLOAD with bounded callback I/O and directory-relative access |
+| `server_protocol_io.c`, `server_protocol_io.h` | Optional nonblocking TLS adapter with a request deadline |
+| `tests/test_server_read_ops.c`, `tests/server_read_faults.h` | Deterministic local read/output faults and full password-cleanup checks |
+| `tests/server_read_fixture.c`, `tests/test_server_read_integration.py` | Concurrent isolated TLS read server, wire checks and actual-client PTY interoperability |
 | `server_util.c` | TLS I/O and filesystem-path helpers |
 | `protocol.h`, `password.h` | Scaffold protocol constants and legacy verifier declaration |
 | `cert_gen.sh` | Generates a self-signed primary test certificate/key |
@@ -333,7 +337,8 @@ fixed-width parsing and worker/config shutdown lifetime remain unchanged.
 | Server TLS/thread scaffold | Present; lifecycle/I/O hardening pending |
 | Isolated server authentication | Implemented/tested; read-only per-call DB ownership |
 | Server request authentication | Still always-success stub; module wiring/parsing pending |
-| Server LIST / DOWNLOAD | Success-returning stubs; no file data returned |
+| Isolated server LIST / DOWNLOAD | Implemented/tested; local auth, sorted listing, safe streaming |
+| Production server LIST / DOWNLOAD | Still success-returning stubs; dispatch wiring pending |
 | Server UPLOAD / DELETE | Local filesystem paths only |
 | Replication / prepare-commit / mTLS | Not implemented in this checkout |
 | Primary/replica role enforcement | Pending |
@@ -350,7 +355,7 @@ test-password-db          test-client-config
 test-client-password      test-client-transport
 test-client-protocol      test-client-commands
 test-client-failover       test-server-auth
-test-server-auth-faults
+test-server-auth-faults    test-server-read
 ```
 
 For example, `make test-server-auth`. `test-client-commands` runs the Python TLS
@@ -405,6 +410,48 @@ compilation workflow to keep synchronized. macOS is locally tested; the system
 OpenSSL path is intended for Linux/POSIX environments but has not been run on Linux
 in this checkout.
 
+## Isolated authenticated server reads
+
+`make OPENSSL_PREFIX="$(brew --prefix openssl@3)" test-server-read` runs the
+read-handler suite alone; `make test` and `make sanitize` include it automatically.
+It runs deterministic callback/fault tests, a temporary concurrent C TLS server,
+wire-boundary and filesystem checks, and five actual-client PTY scenarios: LIST,
+DOWNLOAD, authentication failures for both, and a missing download. Test fixtures
+provision temporary credentials and certificates; production server startup is
+not involved. Root runs explicitly skip filesystem permission-denial cases.
+
+`server_handle_list` and `server_handle_download` consume credentials after a
+caller has read the literal verb. They authenticate with a private read-only DB
+handle per call and own the entire response. The result distinguishes a complete
+response from a local/transport failure requiring connection termination. A future
+wrapper must **not append another status**. The callback interface supports exact
+I/O and abort; `server_protocol_io_init` adapts a completed TLS connection using
+nonblocking SSL-first I/O, WANT_READ/WANT_WRITE handling, a monotonic whole-operation
+network deadline, and thread-local SIGPIPE protection. It borrows the SSL/socket;
+the caller must close/free them after the operation. Disk and DB calls are not
+made asynchronous or bounded by that network deadline.
+
+LIST returns sorted regular-file names (maximum 10,000; overflow returns INTERNAL).
+An absent user directory is an empty list; DOWNLOAD returns NOT_FOUND for an
+absent user directory/file, symlink, directory or FIFO. An inaccessible root/user
+folder returns INTERNAL. Names beginning `.temp_` are reserved staging names and
+are neither listed nor downloadable; other valid dotfiles remain visible.
+Username validation and directory-relative no-follow opens prevent traversal and
+user-directory/file symlink escapes. Administrator-controlled root ancestors and
+file ownership remain deployment requirements; hard links are not distinguished
+from ordinary regular files. Neither reads nor admin create user directories.
+
+DOWNLOAD sends a big-endian 32-bit size and streams exactly that many bytes in
+bounded chunks; larger files return TOO_LARGE. Once OK is sent, local read or TLS
+failure aborts the connection without an extra status. Committed files should be
+published by rename, not modified in place: readers pin an opened inode, but LIST
+is not a transactional snapshot of concurrent writes. See
+INTEGRATION_ASSUMPTIONS.md for integration ownership and policies.
+
+Production dispatch/startup wiring, primary/replica roles, and partner replicated
+writes are still pending. The production executable has not been linked to these
+read handlers and still cannot serve authenticated LIST/DOWNLOAD.
+
 ## Known Limitations / Work in Progress
 
 - Client wire behavior follows the frozen working contract; the stale server scaffold
@@ -412,8 +459,9 @@ in this checkout.
 - Server credential parsing is not yet safe to connect directly to the database API.
 - Server replication, role enforcement and final authentication remain incomplete.
 - Credential provisioning is manual on each node; no credential replication exists.
-- Client commands are validated against mock TLS servers, not the current scaffold.
-  A successful mock result does not establish deployed replication or authentication.
+- Client commands are validated against mock TLS servers and isolated read handlers,
+  not the current scaffold.
+  A successful fixture result does not establish deployed replication or authentication.
 - Transport uses one 5-second deadline for TCP attempts plus TLS handshake after
   resolution, and one deadline per read/write call; a timeout API permits overrides.
   Synchronous getaddrinfo is not deadline-bounded. Close makes one nonblocking

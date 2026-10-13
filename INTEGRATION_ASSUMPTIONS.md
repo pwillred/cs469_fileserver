@@ -98,6 +98,74 @@ DELETE request:    "DELETE" username\0 password\0 filename\0
 DELETE response:   status:u8
 ```
 
+## Isolated server read handlers (implemented; production wiring pending)
+
+`server_read_ops.h` exposes `server_read_context_t {data_dir, auth_db_path}`,
+`server_read_io_t {state, read_exact, write_all, abort}`, and
+`server_handle_list(io, context)` / `server_handle_download(io, context)`.
+The dispatcher must consume exactly the literal verb first. Every callback
+transfers exactly the requested byte count or returns failure. The handlers parse
+bounded NUL fields (65-byte credentials, 257-byte filename), authenticate locally
+through `server_auth`, and cleanse the **entire 65-byte password buffer** on every
+parsing/authentication path. Unknown-user and wrong-password responses are identical.
+No peer connection, role decision, schema provisioning or shared DB handle exists.
+
+Responses are precisely the read layouts above: explicit numeric u8 status,
+u32 big-endian count/size, and only the specified names or raw bytes. The returned
+`server_read_result_t {status, complete}` is for local control/logging; it is **not
+an instruction to send another status**. Complete includes a successfully sent
+error response. Incomplete means the abort callback was invoked; log a generic
+local failure and close/free transport without additional application output.
+After any response, close the one-operation connection. This requires bypassing
+the legacy `handle_client` unconditional final `send_error` on the new read path.
+
+Policies:
+
+- Missing authenticated user folder: LIST is OK/count zero; DOWNLOAD is NOT_FOUND.
+  Missing/unusable data root and inaccessible user directory are INTERNAL. Reads
+  never create directories. User-directory symlinks/non-directories are INTERNAL.
+- LIST includes only regular files with frozen-contract-valid names, sorted by
+  bytewise lexicographic order. Directory entries, symlinks, non-ASCII/control or
+  otherwise invalid filenames are excluded. At most 10,000 names are retained;
+  a 10,001st eligible entry yields INTERNAL before any OK is sent.
+- The current upload staging prefix `.temp_` is reserved: exclude it from LIST
+  and return NOT_FOUND for DOWNLOAD. Other valid dotfiles are allowed. There is
+  no additional metadata namespace in the current scaffold; coordinate any new
+  internal naming convention with read filtering before introducing it.
+- Open the trusted configured root, then authenticated username and filename
+  using directory-relative APIs. User directories and download files use
+  O_NOFOLLOW, and downloaded descriptors must be regular by fstat. Symlink files,
+  directories and FIFOs return NOT_FOUND; local open/stat errors return INTERNAL.
+  Root ancestors/DB configuration must be administrator-controlled. The service
+  does not defend against privileged filesystem changes or cross-user hard links
+  created by another local actor; provision permissions accordingly.
+- DOWNLOAD uses at most 16 KiB per local read, accepts sizes through UINT32_MAX,
+  and rejects larger files with TOO_LARGE. A short positive read is continued;
+  premature EOF or local I/O failure aborts. After OK, **no extra error/status**
+  can be sent on failure. File growth beyond the initial size is not streamed.
+- LIST is not a snapshot transaction. Vanished entries are skipped; other stat
+  failures yield INTERNAL before success. Open DOWNLOAD descriptors survive
+  atomic rename/delete; in-place truncation is detected, but in-place same-size
+  modification cannot guarantee snapshot consistency. Partner writes should
+  publish committed files with rename and retain the staging convention.
+
+`server_protocol_io` is an optional isolated TLS adapter. Initialize it only after
+successful TLS handshake, with a positive timeout in milliseconds (future server
+configuration can supply its existing 15-second policy). It sets the borrowed
+socket nonblocking, tries SSL_read before polling, retries WANT_READ/WANT_WRITE,
+and guards SIGPIPE in the calling thread. One monotonic deadline covers all
+network I/O for the request/response, preventing per-byte timeout extension.
+DB/disk latency and the caller's handshake are outside this adapter's deadline.
+It does not restore blocking mode: the caller closes the connection after use.
+
+Remaining coordinated hooks: provision each node's DB and directories; add the
+startup auth DB path with safe worker lifetimes; parse literal verbs; initialize
+the TLS adapter; dispatch reads on either role; honor complete/abort and sole
+response ownership; retain primary-only writes and partner replication separately.
+No changes to production server sources, worker lifecycle, writes, client contract
+or `protocol.h` are part of this implementation. The test-only TLS harness and real
+client validate these isolated handlers, not the production scaffold.
+
 ## Routing and failover
 
 The client knows topology from `client.conf`; users address one logical service.
@@ -135,9 +203,12 @@ The original server scaffold does not yet implement this contract:
   reading through a NUL delimiter, and do not enforce termination.
 - Upload reads filename before size, receives the payload immediately, and sends
   only the wrapper's final status. There is no preliminary acceptance status.
-- LIST/DOWNLOAD return success without response payloads or authentication.
+- Production LIST/DOWNLOAD still return success without response payloads or
+  authentication; the new isolated handlers are not wired to that dispatcher.
 - Status output takes one byte from an enum object rather than explicit u8 encoding.
 - Password verification still always succeeds; roles/replication are not implemented.
 
 These conflicts are recorded, not repaired here. TLS primitives can be tested
-independently, but command interoperability requires coordinated server changes.
+independently; production command interoperability still requires coordinated
+server changes. Isolated read handlers now interoperate with the completed client
+through a test-only TLS dispatcher.
