@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 struct password_db {
     sqlite3 *connection;
@@ -63,7 +64,7 @@ void password_db_close(password_db_t *db) {
     free(db);
 }
 
-int password_db_open(const char *path, password_db_t **out) {
+static int open_database(const char *path, password_db_t **out, int flags) {
     if (out == NULL) {
         return PASSWORD_DB_INVALID_ARGUMENT;
     }
@@ -81,8 +82,7 @@ int password_db_open(const char *path, password_db_t **out) {
     }
 
     int rc = sqlite3_open_v2(path, &db->connection,
-        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX |
-        SQLITE_OPEN_PRIVATECACHE, NULL);
+        flags | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_PRIVATECACHE, NULL);
     if (rc != SQLITE_OK) {
         int result = sqlite_failure("open", rc);
         password_db_close(db);
@@ -104,6 +104,23 @@ int password_db_open(const char *path, password_db_t **out) {
 
     *out = db;
     return PASSWORD_DB_OK;
+}
+
+int password_db_open(const char *path, password_db_t **out) {
+    return open_database(path, out, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
+}
+
+int password_db_open_existing(const char *path, password_db_t **out) {
+    if (out == NULL) return PASSWORD_DB_INVALID_ARGUMENT;
+    *out = NULL;
+    if (path == NULL || path[0] == '\0' || strcmp(path, ":memory:") == 0 ||
+        strncmp(path, "file:", 5) == 0) return PASSWORD_DB_INVALID_ARGUMENT;
+    /* Exclude devices/FIFOs/directories before SQLite opens the path. READONLY
+     * (without CREATE) also prevents creation if the file disappears afterward.
+     * The configured path and its containing directories must be trusted. */
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return PASSWORD_DB_SQLITE_ERROR;
+    return open_database(path, out, SQLITE_OPEN_READONLY);
 }
 
 int password_db_init_schema(password_db_t *db) {

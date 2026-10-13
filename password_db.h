@@ -37,6 +37,18 @@ enum {
  */
 int password_db_open(const char *path, password_db_t **out);
 
+/* Open an existing regular filesystem file READ-ONLY, never CREATE. Intended
+ * for authentication; leaves provisioning/mutations to the existing admin API.
+ * Rejects NULL/empty, :memory: and file: URI paths as INVALID_ARGUMENT. Missing,
+ * non-regular or unusable files return SQLITE_ERROR (or NO_MEMORY). *out is NULL
+ * on failure. A successful open does not validate schema; verify_user detects
+ * missing/incompatible credential columns and malformed records. Do not call
+ * init_schema to provision an authentication database. Ownership/threading and
+ * lock timeout match password_db_open. Symlinks may resolve to regular files;
+ * path and containing directories must be administrator-controlled.
+ */
+int password_db_open_existing(const char *path, password_db_t **out);
+
 /*
  * Create the users table if absent. Repeated calls preserve existing data.
  * Returns PASSWORD_DB_OK, PASSWORD_DB_INVALID_ARGUMENT for NULL, or the memory/

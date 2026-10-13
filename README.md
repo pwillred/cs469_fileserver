@@ -3,9 +3,10 @@
 A CS469 Distributed Systems project at Regis University by Fedil Grogan and
 Brian Leake. The target is a secure file service with a CLI client, a primary
 server, and a read-only replica. **The distributed service is not complete:**
-local credential administration, client commands, and client read failover are implemented.
+local credential administration, client commands, client read failover, and an
+isolated server authentication module are implemented.
 The client executes LIST/UPLOAD/DOWNLOAD/DELETE over verified TLS against the
-frozen working contract, tested with local mock servers. Server authentication,
+frozen working contract, tested with local mock servers. Server authentication wiring,
 read operations, replication, and final client/server integration
 remain pending. The current server scaffold is not wire-compatible with the client.
 
@@ -82,10 +83,12 @@ failures never trigger failover. There is no insecure client mode or general ret
 | `INTEGRATION_ASSUMPTIONS.md` | Working wire contract and current scaffold conflicts |
 | `server.c`, `server.h` | TLS/TCP startup, configuration, detached connection threads |
 | `server_ops.c` | Dispatch, local writes, authentication/read stubs |
+| `server_auth.c`, `server_auth.h` | Isolated decoded-credential validation, DB verification and error mapping; not wired to handlers |
 | `server_util.c` | TLS I/O and filesystem-path helpers |
 | `protocol.h`, `password.h` | Scaffold protocol constants and legacy verifier declaration |
 | `cert_gen.sh` | Generates a self-signed primary test certificate/key |
 | `tests/test_password_db.c` | Database and account-management tests |
+| `tests/test_server_auth.c` | Temporary DB authentication, concurrency, cleanup and fault-mapping tests |
 | `tests/test_client_config.c` | CLI and configuration-file tests |
 | `tests/test_client_password.c` | Pseudo-terminal password/cleanup tests |
 | `tests/test_client_transport.c` | Loopback TLS, trust, identity, I/O and cleanup tests |
@@ -127,6 +130,12 @@ cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
   client_commands.c client_protocol.c client_transport.c -lssl -lcrypto -lpthread
 cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
   -o "$BUILD_DIR/test_password_db" tests/test_password_db.c password_db.c -lsqlite3 -lcrypto
+cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
+  -o "$BUILD_DIR/test_server_auth" tests/test_server_auth.c server_auth.c password_db.c \
+  -lsqlite3 -lcrypto -lpthread
+# Fault mode replaces DB operations to exercise rare/internal return values.
+cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS -DSERVER_AUTH_FAULT_TEST \
+  -o "$BUILD_DIR/test_server_auth_faults" tests/test_server_auth.c server_auth.c -lcrypto
 cc $CFLAGS -o "$BUILD_DIR/test_client_config" tests/test_client_config.c client_config.c
 cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
   -o "$BUILD_DIR/test_client_password" tests/test_client_password.c client_password.c -lcrypto -lutil
@@ -291,6 +300,38 @@ Zero-byte uploads/downloads work. Successful writes/downloads print a concise
 completion message; errors go to stderr with a nonzero exit code. An interrupted
 upload/delete can have an unknown remote outcome and is never automatically retried.
 
+## Isolated Server Authentication
+
+`server_auth_verify(db_path, username, username_size, password, password_size)`
+accepts decoded spans whose sizes include exactly one final NUL. It requires
+1–64 username characters from ASCII letters/digits/underscore/hyphen (the DB
+policy), and 1–64 printable ASCII password characters. Unterminated, embedded-NUL,
+padded and overlong fields return BAD_REQUEST without truncation. Password storage
+is borrowed and cleansed across the entire supplied span on every return; the
+caller must clear any remaining capacity and buffers on earlier parsing failures.
+
+Each call opens its own DB with `password_db_open_existing`, verifies, and closes.
+The new API opens read-only without CREATE, rejecting missing/non-regular files
+and memory/URI paths; it never initializes schema. This avoids the creation race
+of an existence check followed by the admin API's CREATE open. Missing/unusable
+DBs and missing schemas fail INTERNAL. Existing admin create/mutation behavior is
+unchanged. Provision accounts locally on both nodes using the admin CLI.
+
+Only PASSWORD_DB_OK authenticates. Missing user and wrong password both return
+SERVER_AUTH_FAILED / ERR_AUTH_FAILED. Database, crypto, unsupported algorithm,
+corrupt record, allocation and unexpected errors map to INTERNAL. Malformed
+credentials map to BAD_REQUEST before opening the DB; an unexpected DB
+INVALID_ARGUMENT after successful validation maps to INTERNAL. Result codes
+conceal account existence, but the underlying DB verification does not equalize
+lookup/KDF timing. Authentication creates no shared handles or mutable global state.
+
+**Not active in the server yet:** future startup must accept `--auth-db users.db`
+and provide `server_config_t.auth_db_path` with lifetime covering active workers.
+The future credential reader must consume bounded NUL-terminated fields over TLS,
+pass their actual lengths plus NUL, map `server_auth_to_error`, and cleanse its full
+wire buffer. Do not use boolean tests: SERVER_AUTH_OK is zero. The old verifier,
+fixed-width parsing and worker/config shutdown lifetime remain unchanged.
+
 ## Current Implementation Status
 
 | Area | Status in this checkout |
@@ -300,7 +341,8 @@ upload/delete can have an unknown remote outcome and is never automatically retr
 | Client CLI/configuration | Implemented and tested |
 | Client secure password input | Implemented; credentials sent only inside verified TLS |
 | Server TLS/thread scaffold | Present; lifecycle/I/O hardening pending |
-| Server authentication | Always-success stub; DB integration pending |
+| Isolated server authentication | Implemented/tested; read-only per-call DB ownership |
+| Server request authentication | Still always-success stub; module wiring/parsing pending |
 | Server LIST / DOWNLOAD | Success-returning stubs; no file data returned |
 | Server UPLOAD / DELETE | Local filesystem paths only |
 | Replication / prepare-commit / mTLS | Not implemented in this checkout |
@@ -315,6 +357,8 @@ After the direct builds above:
 
 ```sh
 "$BUILD_DIR/test_password_db"
+"$BUILD_DIR/test_server_auth"
+"$BUILD_DIR/test_server_auth_faults"
 "$BUILD_DIR/test_client_config"
 "$BUILD_DIR/test_client_password"
 "$BUILD_DIR/test_client_transport"
@@ -323,7 +367,12 @@ After the direct builds above:
 python3 tests/test_client_integration.py "$BUILD_DIR/client" "$BUILD_DIR/test_client_commands"
 ```
 
-The database suite creates and removes temporary databases. Configuration tests
+The database and authentication suites create and remove temporary databases.
+Auth tests cover invalid spans, missing/schema/corrupt/unreadable DBs, a real
+5-second lock timeout, read-only behavior, independent concurrent calls, password
+erasure and secret-free diagnostics. Permission-denial testing is skipped when
+running as root. Fault mode checks open/verify return mappings, including rare
+crypto/allocation errors and unexpected values. Configuration tests
 create and remove a temporary config file; pure CLI parsing requires no files.
 Neither test path uses DNS or a server. Password tests create pseudo-terminals
 and verify hidden
