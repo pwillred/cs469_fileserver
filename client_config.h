@@ -71,7 +71,7 @@ int client_parse_options(int argc, char *const argv[], client_options_t *options
  * All file handles are closed. No global state or heap ownership is exposed.
  *
  * Users address one logical service. Deployment topology stays internal:
- * future LIST/DOWNLOAD use primary first with automatic eligible read failover;
+ * LIST/DOWNLOAD use primary first with automatic eligible read failover;
  * writes stay primary-only. Loading configuration does not implement routing.
  */
 int client_config_load(const char *path, client_deployment_config_t *config,

@@ -19,7 +19,8 @@ const char *client_usage(void) {
         "  delete REMOTE_NAME\n\n"
         "Options must precede the command; default configuration: client.conf.\n"
         "Topology belongs in configuration. Password arguments are unsupported.\n"
-        "All commands currently use the primary; no retry or failover.\n";
+        "Reads try primary, then replica only on eligible pre-status transport failure.\n"
+        "Writes use primary only; no write retry or failover.\n";
 }
 
 static int fail(const char **error, const char *message) {
