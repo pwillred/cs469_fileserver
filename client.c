@@ -1,6 +1,6 @@
 /*
  * CS 469
- * Primary-only file-service client using the frozen working wire contract.
+ * File-service client using the frozen working wire contract and read failover.
  */
 #include "client_config.h"
 #include "client_password.h"

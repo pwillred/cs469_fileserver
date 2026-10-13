@@ -85,6 +85,7 @@ def run_process(args, environment, interactive):
         os.write(master, password + b'\n')
         out, err = process.communicate(timeout=15)
         require(password not in out + err + prompt, 'password leaked to output')
+        require((bytes(prompt) + err).count(b'Password: ') == 1, 'password prompted more than once')
         # Terminal stdin is separate from stderr, so any echo would appear here.
         if select.select([master], [], [], 0)[0]:
             try:
@@ -122,11 +123,18 @@ with tempfile.TemporaryDirectory(prefix='cs469-codec-') as root:
                 '-subj', '/CN=Untrusted CA', '-keyout', root/'other.key', '-out', root/'other.pem')
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)
+    (root/'wrong-extensions').write_text('subjectAltName=DNS:other.example,IP:127.0.0.2\nextendedKeyUsage=serverAuth\n')
+    openssl_run('x509', '-req', '-in', root/'server.csr', '-CA', ca, '-CAkey', root/'ca.key',
+                '-CAserial', root/'ca.srl', '-days', '1', '-extfile', root/'wrong-extensions', '-out', root/'wrong.pem')
+    wrong_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    wrong_context.load_cert_chain(root/'wrong.pem', key)
 
     def case(name, command, handler=None, *, payload=b'', ok=True, message=b'', expected_output=None,
              existing=None, disk_fault=False, read_fault=False, long_password=False,
              refused=False, bad_cert=False, interactive=False, expect_file=None, truncate=False,
-             race=False, source_directory=False, huge=False, symlink=False):
+             race=False, source_directory=False, huge=False, symlink=False,
+             replica_handler=None, replica_refused=False, expected_failover=False,
+             primary_mode=None, identity_mismatch=False, primary_host='127.0.0.1', invalid_ca=False):
         global COUNT
         COUNT += 1
         folder = root/str(COUNT)
@@ -147,40 +155,56 @@ with tempfile.TemporaryDirectory(prefix='cs469-codec-') as root:
             primary = stack.enter_context(listener())
             replica = stack.enter_context(listener())
             port = primary.getsockname()[1]
+            replica_port = replica.getsockname()[1]
+            if replica_refused:
+                replica.close()
             if refused:
                 primary.close()
             config = folder/'client.conf'
-            config.write_text(f'primary_host=127.0.0.1\nprimary_port={port}\n'
-                              f'replica_host=127.0.0.1\nreplica_port={replica.getsockname()[1]}\n'
-                              f'ca_file={root/"other.pem" if bad_cert else ca}\n')
+            config.write_text(f'primary_host={primary_host}\nprimary_port={port}\n'
+                              f'replica_host=127.0.0.1\nreplica_port={replica_port}\n'
+                              f'ca_file={root/"missing.pem" if invalid_ca else root/"other.pem" if bad_cert else ca}\n')
             failures = []
 
-            def serve():
+            accepted = [0, 0]
+
+            def serve(listener, response, role):
                 try:
-                    raw, _ = primary.accept()
+                    raw, _ = listener.accept()
+                    accepted[role] += 1
                     raw.settimeout(8)
                     with raw:
+                        if role == 0 and primary_mode == 'handshake-loss':
+                            return
+                        if role == 0 and primary_mode == 'handshake-timeout':
+                            time.sleep(5.3)  # Real production handshake deadline is 5 seconds.
+                            return
+                        ctx = wrong_context if role == 0 and identity_mismatch else context
+                        reject_tls = role == 0 and (bad_cert or identity_mismatch)
                         try:
-                            connection = context.wrap_socket(raw, server_side=True)
+                            connection = ctx.wrap_socket(raw, server_side=True)
                         except ssl.SSLError:
-                            if bad_cert:
+                            if reject_tls:
                                 return
                             raise
                         with connection:
-                            require(not bad_cert, 'untrusted server was accepted')
+                            require(not reject_tls, 'untrusted identity was accepted')
                             expected = header(command, len(payload))
                             require(exact(connection, len(expected)) == expected, 'wire request differs from frozen contract')
                             if truncate:
                                 source.write_bytes(b'')
                             if race:
                                 destination.write_bytes(b'racing file')
-                            handler(connection)
+                            response(connection)
                 except BaseException as exc:
                     failures.append(exc)
 
-            thread = None
-            if handler is not None or bad_cert:
-                thread = threading.Thread(target=serve, daemon=True)
+            threads = []
+            if handler is not None or bad_cert or identity_mismatch or primary_mode:
+                threads.append(threading.Thread(target=serve, args=(primary, handler, 0), daemon=True))
+            if replica_handler is not None:
+                threads.append(threading.Thread(target=serve, args=(replica, replica_handler, 1), daemon=True))
+            for thread in threads:
                 thread.start()
             arguments = [CLIENT if interactive else RUNNER, '--config', str(config), '--username', 'alice', command]
             if command == 'upload':
@@ -196,20 +220,28 @@ with tempfile.TemporaryDirectory(prefix='cs469-codec-') as root:
                 if value:
                     environment[setting] = '1'
             rc, out, err = run_process(arguments, environment, interactive)
-            if thread:
+            for thread in threads:
                 thread.join(10)
                 require(not thread.is_alive(), 'mock server did not finish')
             if failures:
                 raise failures[0]
             require(rc == (0 if ok else 1), f'{name}: unexpected exit {rc}: {err.decode(errors="replace")}')
             require(message in err, f'{name}: missing diagnostic')
+            require(err.count(b'Primary server unavailable; trying replica...') == int(expected_failover),
+                    f'{name}: incorrect failover diagnostic/count')
+            if expected_failover and not ok:
+                require(b'Read could not be completed' in err, 'missing overall read failure diagnostic')
+            require(accepted[1] == int(replica_handler is not None), 'replica attempt count differs')
+            require(accepted[0] == int(bool(handler is not None or bad_cert or identity_mismatch or primary_mode)),
+                    'primary attempt count differs')
             require(b'AddressSanitizer' not in err and b'runtime error:' not in err, 'sanitizer diagnostics')
             if expected_output is not None:
                 require(out == expected_output, f'{name}: unexpected stdout')
             require(PASSWORD not in out + err, 'password leaked')
             if not refused:
                 no_connection(primary)
-            no_connection(replica)
+            if not replica_refused:
+                no_connection(replica)
             require(not list(folder.glob('.cs469-download-*')), f'{name}: staging file remains')
             if command == 'download':
                 if symlink:
@@ -293,9 +325,49 @@ with tempfile.TemporaryDirectory(prefix='cs469-codec-') as root:
         case('delete status '+str(status), 'delete', reply(bytes([status])), ok=False, message=text)
     case('unknown status rejected', 'delete', reply(b'\xff'), ok=False, message=b'Protocol error')
     case('certificate failure distinct', 'list', bad_cert=True, ok=False, message=b'verification failed')
-    case('connection refused, no failover', 'list', refused=True, ok=False, message=b'TCP connection failed')
+    case('both read endpoints refused', 'list', refused=True, replica_refused=True, expected_failover=True, ok=False, message=b'TCP connection failed')
     case('wire-overlong password before connect', 'list', long_password=True, ok=False, message=b'printable ASCII')
     case('wire-overlong password executable', 'list', long_password=True, interactive=True, ok=False, message=b'printable ASCII')
     case('executable application error', 'delete', reply(b'\1'), interactive=True, ok=False, message=b'Authentication failed')
     case('executable partial download cleanup', 'download', reply(b'\0\0\0\0\4xx'), interactive=True, ok=False)
+    # Failover suite: exact requests on each endpoint, at most one accepted
+    # connection each, and the existing cleanup/output/secret assertions above.
+    list_reply = b'\0\0\0\0\1replica.txt\0'
+    download_reply = b'\0' + struct.pack('!I', len(CHUNK)) + CHUNK
+    for command in ('list', 'download'):
+        data = list_reply if command == 'list' else download_reply
+        expected = {'expected_output': b'replica.txt\n'} if command == 'list' else {'expect_file': CHUNK}
+        case(command+' refused primary -> replica', command, refused=True, replica_handler=reply(data),
+             expected_failover=True, **expected)
+        case(command+' EOF before status -> replica', command, reply(b''), replica_handler=reply(data),
+             expected_failover=True, **expected)
+        case(command+' handshake loss -> replica', command, primary_mode='handshake-loss', replica_handler=reply(data),
+             expected_failover=True, **expected)
+        case(command+' failover executable prompts once', command, refused=True, replica_handler=reply(data),
+             expected_failover=True, interactive=True, **expected)
+        case(command+' both endpoints fail before status', command, reply(b''), replica_handler=reply(b''),
+             expected_failover=True, ok=False)
+        case(command+' OK then no length/count: no failover', command, reply(b'\0'), ok=False)
+        case(command+' unknown status: no failover', command, reply(b'\xff'), ok=False, message=b'Protocol error')
+        case(command+' DNS certificate mismatch: no failover', command, identity_mismatch=True, primary_host='localhost',
+             ok=False, message=b'verification failed')
+        case(command+' IP certificate mismatch: no failover', command, identity_mismatch=True,
+             ok=False, message=b'verification failed')
+        case(command+' missing CA: no failover', command, invalid_ca=True, ok=False, message=b'configured CA')
+        case(command+' replica application error is final', command, refused=True, replica_handler=reply(b'\1'),
+             expected_failover=True, ok=False, message=b'Authentication failed')
+    case('LIST real handshake timeout -> replica', 'list', primary_mode='handshake-timeout',
+         replica_handler=reply(list_reply), expected_failover=True, expected_output=b'replica.txt\n')
+    case('LIST application NOT_FOUND: no failover', 'list', reply(b'\2'), ok=False, message=b'File not found')
+    case('DOWNLOAD authentication failure: no failover', 'download', reply(b'\1'), ok=False, message=b'Authentication failed')
+    case('DOWNLOAD certificate failure: no failover', 'download', bad_cert=True, ok=False, message=b'verification failed')
+    case('DOWNLOAD failover zero bytes', 'download', refused=True, replica_handler=reply(b'\0\0\0\0\0'),
+         expected_failover=True, expect_file=b'')
+    case('DOWNLOAD both endpoints refused', 'download', refused=True, replica_refused=True,
+         expected_failover=True, ok=False, message=b'TCP connection failed')
+    case('DOWNLOAD replica partial payload cleanup', 'download', refused=True, replica_handler=reply(b'\0\0\0\0\4xx'),
+         expected_failover=True, ok=False)
+    for command in ('upload', 'delete'):
+        case(command+' connection refused: no replica', command, refused=True, ok=False, message=b'TCP connection failed')
+        case(command+' EOF before status: no replica', command, reply(b''), ok=False)
     print(f'All {COUNT} TLS command/executable cases passed; temporary fixtures removed on exit.')

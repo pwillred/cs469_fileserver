@@ -68,13 +68,22 @@ DELETE response:   status:u8
 ## Routing and failover
 
 The client knows topology from `client.conf`; users address one logical service.
-LIST/DOWNLOAD start with the primary and may fail over only for eligible
-connection/transport unavailability. UPLOAD/DELETE always use the primary and
-never fail over. Certificate/identity failures and invalid trust configuration
-must fail closed, not trigger failover. All application status responses above
-are **not failover triggers**. Future callers must track response/transfer progress
-before deciding whether a read can safely restart. All current client commands
-connect to the primary only; no retry/failover exists yet.
+Client-side failover is implemented for LIST/DOWNLOAD: one primary attempt,
+then at most one replica attempt for RESOLVE_ERROR, CONNECT_ERROR, TIMEOUT,
+IO_ERROR or EOF during connect/request transmission/initial status reading.
+Both attempts use the configured endpoints and verified TLS. The same transient
+password is reused without a second prompt and cleansed after the whole operation.
+
+The boundary is receipt of a **valid application status byte**. Every valid status
+ends failover eligibility, including OK: failures reading count/length or payload
+afterward are final. Unknown statuses, malformed replies, certificate/identity
+failures, invalid CA/configuration, TLS negotiation errors and local failures
+never trigger failover. Download staging is removed on handled transfer failures.
+
+UPLOAD/DELETE always use the primary and never retry or fail over, including after
+ambiguous connection loss. There are no general retry loops or backoff. A failed
+replica attempt is final; the client does not return to the primary. Server-side
+replica support is not established by these client/mock-server tests.
 
 ## Ownership boundary
 

@@ -17,10 +17,35 @@ static client_command_result_t wire_error(int rc) {
     return (client_command_result_t){rc == CLIENT_TRANSPORT_PROTOCOL_ERROR ? CLIENT_RESULT_PROTOCOL : CLIENT_RESULT_TRANSPORT,
         rc, CLIENT_STATUS_OK, rc == CLIENT_TRANSPORT_PROTOCOL_ERROR ? "Protocol error: invalid response." : client_transport_result_string(rc)};
 }
+/* Only availability failures qualify, and only before the initial status.
+ * TLS negotiation/configuration/security and malformed replies fail closed. */
+static int failover_eligible(int rc) {
+    switch (rc) {
+        case CLIENT_TRANSPORT_RESOLVE_ERROR:
+        case CLIENT_TRANSPORT_CONNECT_ERROR:
+        case CLIENT_TRANSPORT_TIMEOUT:
+        case CLIENT_TRANSPORT_IO_ERROR:
+        case CLIENT_TRANSPORT_EOF: return 1;
+        default: return 0;
+    }
+}
+/* One endpoint-specific attempt, ending at the status boundary. The caller
+ * closes any connection on failure. Unknown status bytes return PROTOCOL_ERROR,
+ * so neither a valid application rejection nor malformed status can fail over. */
+static int request_status(const client_options_t *o, const client_endpoint_t *endpoint,
+                          const char *password, uint32_t size,
+                          client_connection_t **c, client_status_t *status) {
+    int rc = client_connection_open(endpoint, o->deployment.ca_file, c);
+    if (rc == CLIENT_TRANSPORT_OK)
+        rc = client_protocol_write_request(*c, o->command, o->username, password, o->remote_name, size);
+    if (rc == CLIENT_TRANSPORT_OK) rc = client_protocol_read_status(*c, status);
+    return rc;
+}
 static client_command_result_t execute(const client_options_t *o, const char *password, FILE *output) {
     client_command_result_t result = {CLIENT_RESULT_OK, 0, CLIENT_STATUS_OK, "Success."};
     client_connection_t *c = NULL;
     int source = -1, target = -1, directory = -1, temp_exists = 0;
+    int replica_attempted = 0;
     char *path = NULL, *basename = NULL;
     char temporary[64] = {0};
     uint32_t size = 0;
@@ -63,9 +88,22 @@ static client_command_result_t execute(const client_options_t *o, const char *pa
             LOCAL("Local destination already exists; refusing to overwrite.");
         if (errno != ENOENT) LOCAL("Unable to inspect local destination.");
     }
-    WIRE(client_connection_open(&o->deployment.primary, o->deployment.ca_file, &c));
-    WIRE(client_protocol_write_request(c, o->command, o->username, password, o->remote_name, size));
-    STATUS();
+    client_status_t initial_status;
+    int rc = request_status(o, &o->deployment.primary, password, size, &c, &initial_status);
+    if ((o->command == CLIENT_COMMAND_LIST || o->command == CLIENT_COMMAND_DOWNLOAD) && failover_eligible(rc)) {
+        client_connection_close(c);
+        c = NULL;
+        replica_attempted = 1;
+        fprintf(stderr, "Primary server unavailable; trying replica...\n");
+        rc = request_status(o, &o->deployment.replica, password, size, &c, &initial_status);
+    }
+    WIRE(rc);
+    if (initial_status != CLIENT_STATUS_OK) {
+        result = (client_command_result_t){CLIENT_RESULT_STATUS, 0, initial_status, client_status_description(initial_status)};
+        goto done;
+    }
+    /* No routing below this point: even OK followed by a truncated length/count
+     * is final for this operation. Download staging starts only after status. */
     if (o->command == CLIENT_COMMAND_LIST) {
         uint32_t count;
         WIRE(client_protocol_read_u32(c, &count));
@@ -131,6 +169,8 @@ done:
         result = local_error("Unable to remove temporary download file.");
     if (directory >= 0) (void)close(directory);
     free(path);
+    if (replica_attempted && result.kind != CLIENT_RESULT_OK)
+        fprintf(stderr, "Read could not be completed after trying the primary and replica.\n");
     return result;
 #undef LOCAL
 #undef WIRE

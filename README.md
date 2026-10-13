@@ -3,10 +3,10 @@
 A CS469 Distributed Systems project at Regis University by Fedil Grogan and
 Brian Leake. The target is a secure file service with a CLI client, a primary
 server, and a read-only replica. **The distributed service is not complete:**
-local credential administration and the primary-only client are implemented.
+local credential administration, client commands, and client read failover are implemented.
 The client executes LIST/UPLOAD/DOWNLOAD/DELETE over verified TLS against the
 frozen working contract, tested with local mock servers. Server authentication,
-read operations, replication, read failover, and final client/server integration
+read operations, replication, and final client/server integration
 remain pending. The current server scaffold is not wire-compatible with the client.
 
 ## Project Overview
@@ -46,10 +46,10 @@ This is a provisioning policy; current server code does not yet open either DB.
 
 The planned design sends writes only to the primary. UPLOAD/DELETE succeed only
 after coordinated replica participation; an unavailable replica causes writes
-to fail. Reads normally use the primary; LIST/DOWNLOAD may retry on the replica
-for eligible availability failures. There is no write failover, and the service
-may degrade to read-only. These guarantees are not implemented yet: current
-upload/delete success reflects local filesystem changes only.
+to fail. The client now tries reads on the primary, then the replica once only
+for eligible transport failure before an application status. Writes never fail
+over. Server-side replication and read support remain incomplete: the current
+server scaffold's upload/delete success reflects local filesystem changes only.
 
 ## Security
 
@@ -63,8 +63,8 @@ The server loads a TLS certificate/key, but real user authentication and per-use
 isolation still need integration. The reusable client transport verifies CA trust
 and DNS/IP identity with TLS 1.2 or newer. Primary-to-replica mTLS remains planned.
 The configuration loader records the CA path; command execution loads that CA
-and verifies the primary before transmitting credentials. There is no insecure
-client mode or automatic retry.
+and verifies each endpoint before transmitting credentials. Certificate/identity
+failures never trigger failover. There is no insecure client mode or general retry.
 
 ## Repository Layout
 
@@ -77,7 +77,7 @@ client mode or automatic retry.
 | `client.conf.example` | Placeholder topology and CA configuration |
 | `client_password.c`, `client_password.h` | Secure single-password terminal input |
 | `client_protocol.c`, `client_protocol.h` | Independent client wire codec, validation and status decoding |
-| `client_commands.c`, `client_commands.h` | Primary-only commands, streaming, safe downloads and password cleanup |
+| `client_commands.c`, `client_commands.h` | Read failover, primary-only writes, safe streaming and password cleanup |
 | `client_transport.c`, `client_transport.h` | Verified TCP/TLS connection and exact I/O primitives |
 | `INTEGRATION_ASSUMPTIONS.md` | Working wire contract and current scaffold conflicts |
 | `server.c`, `server.h` | TLS/TCP startup, configuration, detached connection threads |
@@ -91,7 +91,8 @@ client mode or automatic retry.
 | `tests/test_client_transport.c` | Loopback TLS, trust, identity, I/O and cleanup tests |
 | `tests/test_client_protocol.c` | Exact wire bytes and boundary tests using an in-memory transport |
 | `tests/test_client_commands.c`, `tests/client_io_faults.h` | Password-erasure runner and test-only local I/O fault injection |
-| `tests/test_client_integration.py` | TLS mock servers and actual executable/PTY tests |
+| `tests/test_client_integration.py` | Primary/replica TLS mock servers and executable/PTY tests |
+| `tests/test_client_failover.c` | Deterministic transport failures, routing policy and attempt counts |
 | `Makefile`, `.gitignore` | Server build and C artifact ignores |
 
 ## Dependencies
@@ -132,6 +133,9 @@ cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
 cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
   -o "$BUILD_DIR/test_client_transport" tests/test_client_transport.c client_transport.c -lssl -lcrypto -lpthread
 cc $CFLAGS -o "$BUILD_DIR/test_client_protocol" tests/test_client_protocol.c client_protocol.c
+cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
+  -o "$BUILD_DIR/test_client_failover" tests/test_client_failover.c \
+  client_commands.c client_protocol.c -lcrypto
 # Fault substitution is confined to this test object; production builds use POSIX I/O.
 cc $CFLAGS $OPENSSL_CFLAGS -include tests/client_io_faults.h \
   -Dread=client_test_read -Dwrite=client_test_write \
@@ -227,9 +231,24 @@ directory, not the configuration file. The loader does not open the CA file.
 `--username` is required; options precede the lowercase command. The old
 `--primary-host`, `--primary-port`, `--replica-host`, `--replica-port`, and `--ca`
 CLI options are rejected, as are password options. The client internally retains
-both endpoints. Future LIST/DOWNLOAD failover will be automatic for eligible
-availability failures; UPLOAD/DELETE remain primary-only. **All four commands
-currently connect only to the primary, once, without retry or failover.**
+both endpoints. LIST/DOWNLOAD attempt the primary first, then the replica at most
+once for an eligible transport failure **before a valid status byte is received**.
+UPLOAD/DELETE always use the primary once; writes never retry or fail over.
+
+Eligible transport results are RESOLVE_ERROR, CONNECT_ERROR, TIMEOUT, IO_ERROR,
+and EOF during connect, request transmission, or the initial status read.
+Certificate/identity errors, invalid CA/configuration, TLS negotiation errors,
+protocol errors (including unknown status), local errors and every application
+status are excluded. Once OK arrives, even a truncated length/count before file
+bytes arrive is final: neither LIST nor DOWNLOAD consults the replica afterward.
+Downloads retain their staging-file cleanup on these failures.
+
+On failover, stderr reports `Primary server unavailable; trying replica...`.
+The password is prompted once and reused transiently until the overall operation
+finishes, then cleansed. Replica success produces normal output; replica failure
+reports that the read could not be completed, followed by its specific error.
+There are no retry loops or backoff. Endpoint resolution may still try multiple
+addresses internally within one transport open call.
 Command operands are:
 
 ```text
@@ -288,7 +307,7 @@ upload/delete can have an unknown remote outcome and is never automatically retr
 | Primary/replica role enforcement | Pending |
 | Client TLS transport primitives | Implemented separately; verified connections and exact I/O |
 | Client codec and LIST / UPLOAD / DOWNLOAD / DELETE | Implemented against frozen contract; local TLS mock tests |
-| Read failover | Pending |
+| Client LIST / DOWNLOAD failover | Implemented before initial status only; verified with mocks |
 
 ## Testing
 
@@ -300,6 +319,7 @@ After the direct builds above:
 "$BUILD_DIR/test_client_password"
 "$BUILD_DIR/test_client_transport"
 "$BUILD_DIR/test_client_protocol"
+"$BUILD_DIR/test_client_failover"
 python3 tests/test_client_integration.py "$BUILD_DIR/client" "$BUILD_DIR/test_client_commands"
 ```
 
@@ -322,7 +342,12 @@ checks actual TLS requests, preliminary/final statuses, streaming, malformed
 responses, local read/write faults, no-overwrite races and cleanup. Its command
 runner verifies the entire password allocation is zero after each case; a PTY
 also exercises the actual executable for all four commands and selected failures.
-A replica listener and primary pending-connection checks detect unwanted retries.
+Primary/replica fixtures check failover and detect unwanted additional connections.
+PTY failover cases verify a single password prompt. Routing tests inject resolver
+and TCP timeout results deterministically; TLS fixtures additionally exercise a
+real handshake timeout, pre-status connection loss, certificate/identity failures,
+post-status truncation and write guardrails. No external DNS outage or blackholed
+TCP route is required for deterministic timeout/resolver policy coverage.
 No partner server or external service is needed; temporary fixtures are removed.
 
 For AddressSanitizer/UndefinedBehaviorSanitizer, append
@@ -334,7 +359,7 @@ tools/tests with the same commands, and rerun them. No live server is required.
 - Client wire behavior follows the frozen working contract; the stale server scaffold
   needs coordinated changes before integration.
 - Server credential parsing is not yet safe to connect directly to the database API.
-- Replication, role enforcement, final authentication and failover remain incomplete.
+- Server replication, role enforcement and final authentication remain incomplete.
 - Credential provisioning is manual on each node; no credential replication exists.
 - Client commands are validated against mock TLS servers, not the current scaffold.
   A successful mock result does not establish deployed replication or authentication.
@@ -342,8 +367,9 @@ tools/tests with the same commands, and rerun them. No live server is required.
   resolution, and one deadline per read/write call; a timeout API permits overrides.
   Synchronous getaddrinfo is not deadline-bounded. Close makes one nonblocking
   close_notify attempt. Callers must discard a connection after transfer failure.
-- No automatic replica routing or retries are implemented. See
-  INTEGRATION_ASSUMPTIONS.md for the working contract and scaffold conflicts.
+- Client read failover is implemented only before a valid status. There is no
+  post-status restart, write failover or general retry. See INTEGRATION_ASSUMPTIONS.md
+  for the working contract and scaffold conflicts.
 - Password entry uses terminal editing conventions: backspace edits, Ctrl-U clears,
   Ctrl-D cancels. Signal controls and flow control retain terminal meanings.
 - Handled termination signals cancel client input after restoration; SIGKILL and
