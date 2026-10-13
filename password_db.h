@@ -49,6 +49,12 @@ int password_db_open(const char *path, password_db_t **out);
  */
 int password_db_open_existing(const char *path, password_db_t **out);
 
+/* Read-only startup preflight: checks SQLite integrity and required users
+ * columns without creating/migrating schema. Empty provisioned tables are valid.
+ * Record/KDF validation remains per authentication. Returns OK, INVALID_ARGUMENT
+ * or SQLITE_ERROR. Does not retain statements or change handle ownership. */
+int password_db_check_schema(password_db_t *db);
+
 /*
  * Create the users table if absent. Repeated calls preserve existing data.
  * Returns PASSWORD_DB_OK, PASSWORD_DB_INVALID_ARGUMENT for NULL, or the memory/

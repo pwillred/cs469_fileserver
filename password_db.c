@@ -123,6 +123,27 @@ int password_db_open_existing(const char *path, password_db_t **out) {
     return open_database(path, out, SQLITE_OPEN_READONLY);
 }
 
+int password_db_check_schema(password_db_t *db) {
+    if (!db) return PASSWORD_DB_INVALID_ARGUMENT;
+    sqlite3_stmt *stmt = NULL;
+    int ok = sqlite3_prepare_v2(db->connection, "PRAGMA quick_check", -1, &stmt, NULL) == SQLITE_OK;
+    if (ok) {
+        ok = sqlite3_step(stmt) == SQLITE_ROW;
+        const unsigned char *result = ok ? sqlite3_column_text(stmt, 0) : NULL;
+        ok = result && strcmp((const char *)result, "ok") == 0;
+        if (ok) ok = sqlite3_step(stmt) == SQLITE_DONE;
+    }
+    if (sqlite3_finalize(stmt) != SQLITE_OK) ok = 0;
+    if (!ok) return PASSWORD_DB_SQLITE_ERROR;
+    stmt = NULL;
+    ok = sqlite3_prepare_v2(db->connection,
+        "SELECT id,username,salt,password_hash,algorithm,iterations,created_at,updated_at "
+        "FROM users LIMIT 0", -1, &stmt, NULL) == SQLITE_OK;
+    if (ok) ok = sqlite3_step(stmt) == SQLITE_DONE;
+    if (sqlite3_finalize(stmt) != SQLITE_OK) ok = 0;
+    return ok ? PASSWORD_DB_OK : PASSWORD_DB_SQLITE_ERROR;
+}
+
 int password_db_init_schema(password_db_t *db) {
     if (db == NULL) {
         return PASSWORD_DB_INVALID_ARGUMENT;

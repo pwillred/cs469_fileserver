@@ -3,20 +3,19 @@
 A CS469 Distributed Systems project at Regis University by Fedil Grogan and
 Brian Leake. The target is a secure file service with a CLI client, a primary
 server, and a read-only replica. **The distributed service is not complete:**
-local credential administration, client commands, client read failover, and an
-isolated server authentication and LIST/DOWNLOAD handlers are implemented.
-The client executes LIST/UPLOAD/DOWNLOAD/DELETE over verified TLS against the
-frozen working contract, tested with local mock servers. Server authentication wiring,
-production read dispatch, replication, and final client/server integration
-remain pending. The current server scaffold is not wire-compatible with the client.
+local credential administration, client commands/read failover, production server
+SQLite authentication, and production LIST/DOWNLOAD are implemented and tested.
+Reads interoperate with the completed client over verified TLS. Replication,
+server roles, mTLS between peers, and the UPLOAD acceptance/commit workflow remain
+pending. Current write success reflects local filesystem changes only.
 
 ## Project Overview
 
 The intended operations are LIST, UPLOAD, DOWNLOAD, and DELETE, with per-user
 storage, TLS client connections, mTLS replication, SQLite credentials,
 coordinated synchronous writes, and read failover. The current server provides
-an inbound TLS scaffold and local upload/delete paths, but its password verifier
-still accepts every credential. Do not treat it as an authenticated service.
+inbound TLS, authenticated local reads, and authenticated legacy local upload/delete
+paths. The write paths still await the partner-owned replication workflow.
 
 ## Architecture
 
@@ -41,7 +40,7 @@ Accounts are to be administratively provisioned on each node; credential databas
 are **not part of the file replication protocol**. Matching usernames/passwords
 must be maintained on both nodes, including changes and deletions. Independent
 random salts mean their stored hashes need not be byte-for-byte identical.
-This is a provisioning policy; current server code does not yet open either DB.
+Each running server authenticates against its configured local existing DB.
 
 ## Consistency / Fault Tolerance
 
@@ -49,7 +48,7 @@ The planned design sends writes only to the primary. UPLOAD/DELETE succeed only
 after coordinated replica participation; an unavailable replica causes writes
 to fail. The client now tries reads on the primary, then the replica once only
 for eligible transport failure before an application status. Writes never fail
-over. Server-side replication and read support remain incomplete: the current
+over. Server-side replication remains incomplete: the current
 server scaffold's upload/delete success reflects local filesystem changes only.
 
 ## Security
@@ -60,8 +59,9 @@ parameters, and constant-time hash comparison. Plaintext passwords are not store
 The admin CLI and client prompt hide input and cleanse temporary password buffers;
 password command-line arguments are deliberately prohibited.
 
-The server loads a TLS certificate/key, but real user authentication and per-user
-isolation still need integration. The reusable client transport verifies CA trust
+The server loads a TLS certificate/key and requires a provisioned authentication
+DB. Reads use directory-relative no-follow access within the authenticated user
+directory; legacy write filesystem hardening remains with write integration. The reusable client transport verifies CA trust
 and DNS/IP identity with TLS 1.2 or newer. Primary-to-replica mTLS remains planned.
 The configuration loader records the CA path; command execution loads that CA
 and verifies each endpoint before transmitting credentials. Certificate/identity
@@ -82,10 +82,12 @@ failures never trigger failover. There is no insecure client mode or general ret
 | `client_transport.c`, `client_transport.h` | Verified TCP/TLS connection and exact I/O primitives |
 | `INTEGRATION_ASSUMPTIONS.md` | Working wire contract and current scaffold conflicts |
 | `server.c`, `server.h` | TLS/TCP startup, configuration, detached connection threads |
-| `server_ops.c` | Dispatch, local writes, authentication/read stubs |
+| `server_ops.c` | Exact-verb dispatch, authenticated local writes and read-handler integration |
 | `server_auth.c`, `server_auth.h` | Decoded-credential validation, DB verification and error mapping, used by isolated read handlers |
 | `server_read_ops.c`, `server_read_ops.h` | Isolated authenticated LIST/DOWNLOAD with bounded callback I/O and directory-relative access |
-| `server_protocol_io.c`, `server_protocol_io.h` | Optional nonblocking TLS adapter with a request deadline |
+| `server_protocol_io.c`, `server_protocol_io.h` | Nonblocking production TLS adapter with a request deadline |
+| `server_protocol_fields.h` | Shared bounded NUL reader and explicit status encoding |
+| `tests/test_server_fields.c`, `tests/test_server_credentials.c`, `tests/test_server_production_integration.py` | Status/field boundaries and actual production-server/client integration |
 | `tests/test_server_read_ops.c`, `tests/server_read_faults.h` | Deterministic local read/output faults and full password-cleanup checks |
 | `tests/server_read_fixture.c`, `tests/test_server_read_integration.py` | Concurrent isolated TLS read server, wire checks and actual-client PTY interoperability |
 | `server_util.c` | TLS I/O and filesystem-path helpers |
@@ -155,22 +157,25 @@ or other runtime data there. Clean also removes the original server's root objec
 and generated debug bundles; it does not remove source, configuration, databases
 or certificates outside those generated paths.
 
-Server linkage remains OpenSSL + pthreads; the client also uses OpenSSL + pthreads;
-admin uses SQLite + OpenSSL crypto. The isolated authentication module is tested
-separately and is **not wired into the server** by this build change. The server
-still has the documented runtime limitations below.
+Server linkage includes SQLite, OpenSSL and pthreads. The production executable
+links authentication, read handlers and the TLS adapter. The client uses OpenSSL
+and pthreads; admin uses SQLite and OpenSSL crypto.
 
 Current server invocation:
 
 ```sh
-./server -p 8443 -c primary_cert.pem -k primary_key.pem -d data --timeout 15
+./server -p 8443 -c primary_cert.pem -k primary_key.pem -d data --auth-db users.db --timeout 15
 ```
 
 The `--timeout` argument is optional and defaults to 15 seconds. Supply an
-existing data directory and certificate/key. `bash cert_gen.sh`
+existing data directory, certificate/key, and provisioned `--auth-db` path.
+Startup opens the DB read-only, runs SQLite quick_check and checks required users
+columns. Missing, empty/unprovisioned, corrupt or incompatible DBs fail startup;
+no DB/schema is created or migrated. An empty provisioned users table is valid.
+Stored credential/KDF records are validated during authentication. `bash cert_gen.sh`
 generates a self-signed primary test certificate and an unencrypted private key;
 keep the key private. The script does not provision mTLS or a trusted client CA.
-The server currently has no role, replica-endpoint, or database-path option.
+The server currently has no role or replica-endpoint option.
 
 ## Administrative User Management
 
@@ -197,8 +202,8 @@ Provision the same account separately on the respective nodes, for example:
 ```
 
 These are local administration commands, not remote synchronization. User file
-directories are not created by the admin tool. The server does not consume these
-credentials until authentication integration is implemented.
+directories are not created by the admin tool. The server consumes these
+credentials through its required `--auth-db` configuration.
 
 ## Client Usage
 
@@ -319,12 +324,12 @@ INVALID_ARGUMENT after successful validation maps to INTERNAL. Result codes
 conceal account existence, but the underlying DB verification does not equalize
 lookup/KDF timing. Authentication creates no shared handles or mutable global state.
 
-**Not active in the server yet:** future startup must accept `--auth-db users.db`
-and provide `server_config_t.auth_db_path` with lifetime covering active workers.
-The future credential reader must consume bounded NUL-terminated fields over TLS,
-pass their actual lengths plus NUL, map `server_auth_to_error`, and cleanse its full
-wire buffer. Do not use boolean tests: SERVER_AUTH_OK is zero. The old verifier,
-fixed-width parsing and worker/config shutdown lifetime remain unchanged.
+**Active in production:** `--auth-db` is required and preflighted before listening.
+Every operation parses bounded NUL credentials and authenticates locally. Full
+password capacity is cleansed, including parse failures. Workers own config/path
+copies and TLS-context references, so acceptor shutdown cannot free their state.
+The legacy two-argument verifier symbol remains for source compatibility but is
+unused and always rejects; active callers use `server_auth_verify`.
 
 ## Current Implementation Status
 
@@ -334,11 +339,11 @@ fixed-width parsing and worker/config shutdown lifetime remain unchanged.
 | Admin CLI | Implemented; local administration only |
 | Client CLI/configuration | Implemented and tested |
 | Client secure password input | Implemented; credentials sent only inside verified TLS |
-| Server TLS/thread scaffold | Present; lifecycle/I/O hardening pending |
+| Server TLS/thread scaffold | Detached workers with owned config paths/TLS references; bounded read I/O |
 | Isolated server authentication | Implemented/tested; read-only per-call DB ownership |
-| Server request authentication | Still always-success stub; module wiring/parsing pending |
+| Server request authentication | Implemented for all four commands; required existing DB |
 | Isolated server LIST / DOWNLOAD | Implemented/tested; local auth, sorted listing, safe streaming |
-| Production server LIST / DOWNLOAD | Still success-returning stubs; dispatch wiring pending |
+| Production server LIST / DOWNLOAD | Implemented; actual-client TLS/PTY interoperability tested |
 | Server UPLOAD / DELETE | Local filesystem paths only |
 | Replication / prepare-commit / mTLS | Not implemented in this checkout |
 | Primary/replica role enforcement | Pending |
@@ -356,6 +361,7 @@ test-client-password      test-client-transport
 test-client-protocol      test-client-commands
 test-client-failover       test-server-auth
 test-server-auth-faults    test-server-read
+test-server-production
 ```
 
 For example, `make test-server-auth`. `test-client-commands` runs the Python TLS
@@ -423,8 +429,8 @@ not involved. Root runs explicitly skip filesystem permission-denial cases.
 `server_handle_list` and `server_handle_download` consume credentials after a
 caller has read the literal verb. They authenticate with a private read-only DB
 handle per call and own the entire response. The result distinguishes a complete
-response from a local/transport failure requiring connection termination. A future
-wrapper must **not append another status**. The callback interface supports exact
+response from a local/transport failure requiring connection termination. The production
+wrapper **does not append another status**. The callback interface supports exact
 I/O and abort; `server_protocol_io_init` adapts a completed TLS connection using
 nonblocking SSL-first I/O, WANT_READ/WANT_WRITE handling, a monotonic whole-operation
 network deadline, and thread-local SIGPIPE protection. It borrows the SSL/socket;
@@ -448,20 +454,36 @@ published by rename, not modified in place: readers pin an opened inode, but LIS
 is not a transactional snapshot of concurrent writes. See
 INTEGRATION_ASSUMPTIONS.md for integration ownership and policies.
 
-Production dispatch/startup wiring, primary/replica roles, and partner replicated
-writes are still pending. The production executable has not been linked to these
-read handlers and still cannot serve authenticated LIST/DOWNLOAD.
+Production dispatch/startup wiring is complete. `make test-server-production`
+runs explicit status/field tests, production credential-buffer erasure tests,
+and the actual server executable, including DB
+startup failures, all four verb/auth paths, exact read response framing, five real
+client/PTY cases, concurrent reads and shutdown during an active request. Both
+`make test` and `make sanitize` include it. Local write regressions verify framing
+and existing filesystem behavior, not replicated completion.
+
+Dispatch incrementally matches prefix-free verbs without consuming username bytes.
+With no verb delimiter, `LISTXalice` means LIST for username `Xalice`; nonexistent
+accounts fail authentication. UPLOAD now parses size before its bounded filename,
+but still has **no preliminary acceptance status**. The completed client waits
+for that status before sending data, so normal client UPLOAD remains incompatible
+until partner coordination adds the acceptance/replication workflow. Tests send
+payloads explicitly to exercise the existing local handler; no success is fabricated.
+DELETE retains its single local final status. Neither operation has role enforcement.
+
+The acceptor polls a nonblocking listener at most 500 ms between shutdown checks;
+SIGINT/SIGTERM only set a signal-safe flag. This avoids relying on listener
+shutdown to wake accept on macOS. Existing workers finish independently.
 
 ## Known Limitations / Work in Progress
 
-- Client wire behavior follows the frozen working contract; the stale server scaffold
-  needs coordinated changes before integration.
-- Server credential parsing is not yet safe to connect directly to the database API.
-- Server replication, role enforcement and final authentication remain incomplete.
+- Server replication, role enforcement and peer mTLS remain incomplete.
+- UPLOAD's preliminary acceptance and coordinated commit workflow remain pending;
+  current write success is local only. Legacy write filesystem/I/O-result handling
+  has not been redesigned by the authentication/read integration patch.
 - Credential provisioning is manual on each node; no credential replication exists.
-- Client commands are validated against mock TLS servers and isolated read handlers,
-  not the current scaffold.
-  A successful fixture result does not establish deployed replication or authentication.
+- Production LIST/DOWNLOAD interoperate with the completed client; these tests do
+  not establish replicated-write correctness or deployed role enforcement.
 - Transport uses one 5-second deadline for TCP attempts plus TLS handshake after
   resolution, and one deadline per read/write call; a timeout API permits overrides.
   Synchronous getaddrinfo is not deadline-bounded. Close makes one nonblocking
@@ -473,7 +495,11 @@ read handlers and still cannot serve authenticated LIST/DOWNLOAD.
   Ctrl-D cancels. Signal controls and flow control retain terminal meanings.
 - Handled termination signals cancel client input after restoration; SIGKILL and
   terminal-device loss cannot guarantee cleanup. Prompting is single-threaded.
-- The current server shutdown and TLS read helpers still require hardening.
+- Detached workers retain owned config paths/TLS references through shutdown.
+  Handshake socket waits are bounded; shutdown lets active workers finish. There
+  is no new worker pool, connection limit, or global shutdown deadline. Read network
+  I/O uses one configured operation deadline; legacy writes retain per-call waits
+  and their final status uses the default 15-second write timeout.
 
 ## Team
 

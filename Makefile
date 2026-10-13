@@ -30,7 +30,7 @@ BUILD_DIR := build/normal
 PROGRAM_PREFIX :=
 endif
 
-SERVER_SRC := server.c server_ops.c server_util.c
+SERVER_SRC := server.c server_ops.c server_util.c server_auth.c password_db.c server_read_ops.c server_protocol_io.c
 CLIENT_SRC := client.c client_config.c client_password.c client_transport.c client_protocol.c client_commands.c
 ADMIN_SRC := admin.c password_db.c
 SERVER_OBJS := $(addprefix $(BUILD_DIR)/,$(SERVER_SRC:.c=.o))
@@ -43,15 +43,14 @@ TEST_DIR := $(BUILD_DIR)/tests
 
 TEST_TARGETS := test-password-db test-client-config test-client-password \
  test-client-transport test-client-protocol test-client-commands \
- test-client-failover test-server-auth test-server-auth-faults test-server-read
+ test-client-failover test-server-auth test-server-auth-faults test-server-read test-server-production
 
 .PHONY: all clean test check sanitize help $(TEST_TARGETS) test-client-integration
 all: $(SERVER) $(CLIENT) $(ADMIN)
 
-# The server still uses its legacy auth stub. Linking server_auth here would not
-# wire it into request handling, so that module is built/tested independently.
+# Production reads/authentication use the same modules as the isolated suites.
 $(SERVER): $(SERVER_OBJS)
-	$(CC) $(CFLAGS) $(SANITIZER_FLAGS) $(LDFLAGS) $(OPENSSL_LDFLAGS) -o $@ $^ $(SSL_LIBS) $(THREAD_LIBS) $(LDLIBS)
+	$(CC) $(CFLAGS) $(SANITIZER_FLAGS) $(LDFLAGS) $(OPENSSL_LDFLAGS) -o $@ $^ $(SSL_LIBS) $(SQLITE_LIBS) $(THREAD_LIBS) $(LDLIBS)
 $(CLIENT): $(CLIENT_OBJS)
 	$(CC) $(CFLAGS) $(SANITIZER_FLAGS) $(LDFLAGS) $(OPENSSL_LDFLAGS) -o $@ $^ $(SSL_LIBS) $(THREAD_LIBS) $(LDLIBS)
 $(ADMIN): $(ADMIN_OBJS)
@@ -123,6 +122,20 @@ $(TEST_DIR)/server_read_fixture: $(TEST_DIR)/server_read_fixture.o $(BUILD_DIR)/
 test-server-read: $(TEST_DIR)/test_server_read_ops $(TEST_DIR)/server_read_fixture $(CLIENT)
 	./$(TEST_DIR)/test_server_read_ops
 	$(PYTHON) tests/test_server_read_integration.py $(TEST_DIR)/server_read_fixture ./$(CLIENT)
+
+$(TEST_DIR)/server_ops_credentials.o: server_ops.c Makefile
+	@mkdir -p "$(@D)"
+	$(CC) $(CPPFLAGS) $(PROJECT_CPPFLAGS) $(CFLAGS) $(SANITIZER_FLAGS) -MMD -MP \
+	  -DOPENSSL_cleanse=server_credentials_test_cleanse -Dserver_protocol_io_init=server_credentials_test_io_init -c $< -o $@
+$(TEST_DIR)/test_server_credentials: $(TEST_DIR)/test_server_credentials.o $(TEST_DIR)/server_ops_credentials.o \
+ $(BUILD_DIR)/server_util.o $(BUILD_DIR)/server_auth.o $(BUILD_DIR)/password_db.o $(BUILD_DIR)/server_read_ops.o $(BUILD_DIR)/server_protocol_io.o
+	$(CC) $(CFLAGS) $(SANITIZER_FLAGS) $(LDFLAGS) $(OPENSSL_LDFLAGS) -o $@ $^ $(SQLITE_LIBS) $(SSL_LIBS) $(THREAD_LIBS) $(LDLIBS)
+$(TEST_DIR)/test_server_fields: $(TEST_DIR)/test_server_fields.o
+	$(CC) $(CFLAGS) $(SANITIZER_FLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+test-server-production: $(SERVER) $(CLIENT) $(TEST_DIR)/server_read_fixture $(TEST_DIR)/test_server_fields $(TEST_DIR)/test_server_credentials
+	./$(TEST_DIR)/test_server_fields
+	./$(TEST_DIR)/test_server_credentials
+	$(PYTHON) tests/test_server_production_integration.py ./$(SERVER) ./$(CLIENT) $(TEST_DIR)/server_read_fixture
 
 test: $(TEST_TARGETS)
 check: test
