@@ -101,70 +101,60 @@ failures never trigger failover. There is no insecure client mode or general ret
 ## Dependencies
 
 Use a C compiler, a POSIX environment, pthreads, OpenSSL development headers and
-libraries, SQLite3 development headers/libraries, and `make`. Password terminal
+libraries, SQLite3 development headers/libraries, and GNU Make. Password terminal
 tests also use `openpty`/libutil. macOS needs Command Line Tools; Homebrew OpenSSL
-may require explicit include/library paths. The direct builds below were checked
+may require explicit include/library paths. The Makefile workflow below was checked
 on macOS; Linux requires the corresponding development packages. The command
 integration suite additionally requires Python 3 and the `openssl` CLI.
 
 ## Building
 
-Run these commands from the repository root. Build standalone tools/tests into a
-temporary directory, retained for the following examples:
+Run from the repository root. With system OpenSSL/SQLite development packages
+(for example on Linux):
 
 ```sh
-BUILD_DIR=$(mktemp -d)
-OPENSSL_CFLAGS=
-OPENSSL_LDFLAGS=
-# macOS/Homebrew, if OpenSSL is outside the compiler's default search paths:
-OPENSSL_PREFIX=$(brew --prefix openssl)
-OPENSSL_CFLAGS="-I$OPENSSL_PREFIX/include"
-OPENSSL_LDFLAGS="-L$OPENSSL_PREFIX/lib"
-# On systems with OpenSSL in the default paths, omit the three Homebrew lines.
-CFLAGS="-std=c11 -Wall -Wextra -Wpedantic"
-
-cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
-  -o "$BUILD_DIR/admin" admin.c password_db.c -lsqlite3 -lcrypto
-cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
-  -o "$BUILD_DIR/client" client.c client_config.c client_password.c \
-  client_commands.c client_protocol.c client_transport.c -lssl -lcrypto -lpthread
-cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
-  -o "$BUILD_DIR/test_password_db" tests/test_password_db.c password_db.c -lsqlite3 -lcrypto
-cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
-  -o "$BUILD_DIR/test_server_auth" tests/test_server_auth.c server_auth.c password_db.c \
-  -lsqlite3 -lcrypto -lpthread
-# Fault mode replaces DB operations to exercise rare/internal return values.
-cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS -DSERVER_AUTH_FAULT_TEST \
-  -o "$BUILD_DIR/test_server_auth_faults" tests/test_server_auth.c server_auth.c -lcrypto
-cc $CFLAGS -o "$BUILD_DIR/test_client_config" tests/test_client_config.c client_config.c
-cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
-  -o "$BUILD_DIR/test_client_password" tests/test_client_password.c client_password.c -lcrypto -lutil
-cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
-  -o "$BUILD_DIR/test_client_transport" tests/test_client_transport.c client_transport.c -lssl -lcrypto -lpthread
-cc $CFLAGS -o "$BUILD_DIR/test_client_protocol" tests/test_client_protocol.c client_protocol.c
-cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
-  -o "$BUILD_DIR/test_client_failover" tests/test_client_failover.c \
-  client_commands.c client_protocol.c -lcrypto
-# Fault substitution is confined to this test object; production builds use POSIX I/O.
-cc $CFLAGS $OPENSSL_CFLAGS -include tests/client_io_faults.h \
-  -Dread=client_test_read -Dwrite=client_test_write \
-  -c client_commands.c -o "$BUILD_DIR/test_commands.o"
-cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
-  -o "$BUILD_DIR/test_client_commands" tests/test_client_commands.c \
-  "$BUILD_DIR/test_commands.o" client_config.c client_protocol.c client_transport.c \
-  -lssl -lcrypto -lpthread
+make
+make test
 ```
 
-The existing Makefile builds **only `server`**; it has no admin, client or test
-targets. With dependencies in standard search paths, use `make`. With the variables
-above, the equivalent configured build is:
+On macOS/Homebrew, `openssl@3` is the locally verified formula:
 
 ```sh
-make CFLAGS="-Wall -Wextra $OPENSSL_CFLAGS" LDFLAGS="$OPENSSL_LDFLAGS"
+make OPENSSL_PREFIX="$(brew --prefix openssl@3)"
+make OPENSSL_PREFIX="$(brew --prefix openssl@3)" test
+make OPENSSL_PREFIX="$(brew --prefix openssl@3)" sanitize
 ```
 
-`make clean` removes server objects and the server executable only. It does not
-remove the independently built tools/tests.
+| Command | Purpose |
+| --- | --- |
+| `make` / `make all` | Build `server`, `client`, and `admin` at the repository root |
+| `make server`, `make client`, `make admin` | Build just that executable |
+| `make test` / `make check` | Run every current C suite and Python command integration suite |
+| `make sanitize` | Run the same suites with AddressSanitizer and UndefinedBehaviorSanitizer |
+| `make clean` | Remove generated programs, objects, dependency files and build directories |
+| `make help` | Show a short target summary |
+
+Pass `OPENSSL_PREFIX` to each build/test invocation when needed. It adds include
+and library search paths without hard-coding Homebrew or a user directory.
+`CC`, `CFLAGS`, `CPPFLAGS`, `LDFLAGS`, `LDLIBS`, `PYTHON` (default `python3`), and
+library variables (`SSL_LIBS`, `CRYPTO_LIBS`, `SQLITE_LIBS`, `THREAD_LIBS`, `PTY_LIBS`)
+can be overridden. Defaults use C11, `-Wall -Wextra -Wpedantic`, and POSIX.1-2008
+interface declarations. Run `make clean` before switching compilers, prefixes or
+custom flags; normal and sanitizer modes already have separate object trees.
+
+Normal objects, generated header dependencies and test binaries live under
+`build/normal/`; sanitizer objects, tests and the integration-test client live
+under `build/sanitize/`. Sanitizer tests do not replace the normal root programs.
+The special fault-injection test objects are separate from production objects.
+`build/` is reserved for generated artifacts: do not store databases, certificates
+or other runtime data there. Clean also removes the original server's root objects
+and generated debug bundles; it does not remove source, configuration, databases
+or certificates outside those generated paths.
+
+Server linkage remains OpenSSL + pthreads; the client also uses OpenSSL + pthreads;
+admin uses SQLite + OpenSSL crypto. The isolated authentication module is tested
+separately and is **not wired into the server** by this build change. The server
+still has the documented runtime limitations below.
 
 Current server invocation:
 
@@ -197,9 +187,9 @@ Provision the same account separately on the respective nodes, for example:
 
 ```sh
 # On the primary host:
-"$BUILD_DIR/admin" primary-users.db add alice
+./admin primary-users.db add alice
 # Separately, on the replica host:
-"$BUILD_DIR/admin" replica-users.db add alice
+./admin replica-users.db add alice
 ```
 
 These are local administration commands, not remote synchronization. User file
@@ -209,9 +199,9 @@ credentials until authentication integration is implemented.
 ## Client Usage
 
 ```sh
-"$BUILD_DIR/client" --username alice list
+./client --username alice list
 # Or select a deployment configuration explicitly:
-"$BUILD_DIR/client" --config custom-client.conf --username alice list
+./client --config custom-client.conf --username alice list
 ```
 
 The user addresses one logical file service, not an individual physical server.
@@ -353,19 +343,26 @@ fixed-width parsing and worker/config shutdown lifetime remain unchanged.
 
 ## Testing
 
-After the direct builds above:
+Run `make test` (with `OPENSSL_PREFIX` where required). Individual targets are:
 
-```sh
-"$BUILD_DIR/test_password_db"
-"$BUILD_DIR/test_server_auth"
-"$BUILD_DIR/test_server_auth_faults"
-"$BUILD_DIR/test_client_config"
-"$BUILD_DIR/test_client_password"
-"$BUILD_DIR/test_client_transport"
-"$BUILD_DIR/test_client_protocol"
-"$BUILD_DIR/test_client_failover"
-python3 tests/test_client_integration.py "$BUILD_DIR/client" "$BUILD_DIR/test_client_commands"
+```text
+test-password-db          test-client-config
+test-client-password      test-client-transport
+test-client-protocol      test-client-commands
+test-client-failover       test-server-auth
+test-server-auth-faults
 ```
+
+For example, `make test-server-auth`. `test-client-commands` runs the Python TLS
+harness with both the compiled command runner and actual client executable;
+`test-client-integration` is an alias. `test-server-auth-faults` compiles the existing
+fault-mapping mode separately. Each target builds what it needs and propagates
+failures. Plain `make test` stops at the first failure; with `-j`, already-running
+independent tests may finish before Make exits unsuccessfully.
+
+Tests need POSIX pseudo-terminals and permission to bind loopback ports. The Python
+suite requires `python3` and the `openssl` CLI on PATH (or its existing `OPENSSL`
+environment override). No external service or partner server is required.
 
 The database and authentication suites create and remove temporary databases.
 Auth tests cover invalid spans, missing/schema/corrupt/unreadable DBs, a real
@@ -399,9 +396,14 @@ post-status truncation and write guardrails. No external DNS outage or blackhole
 TCP route is required for deterministic timeout/resolver policy coverage.
 No partner server or external service is needed; temporary fixtures are removed.
 
-For AddressSanitizer/UndefinedBehaviorSanitizer, append
-`-fsanitize=address,undefined -fno-omit-frame-pointer` to `CFLAGS`, rebuild the desired
-tools/tests with the same commands, and rerun them. No live server is required.
+`make sanitize` applies `-fsanitize=address,undefined -fno-omit-frame-pointer`
+and `-fno-sanitize-recover=all` to compilation and linking so detected errors fail
+the target. It runs all the same suites, including TLS/PTY
+integration. It requires a compiler/runtime with ASan/UBSan support. Build commands
+remain visible in Make output for troubleshooting; there is no separate manual
+compilation workflow to keep synchronized. macOS is locally tested; the system
+OpenSSL path is intended for Linux/POSIX environments but has not been run on Linux
+in this checkout.
 
 ## Known Limitations / Work in Progress
 
