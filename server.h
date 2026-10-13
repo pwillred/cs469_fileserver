@@ -11,6 +11,7 @@
 #define DEFAULT_TIMEOUT 15
 
 #include "protocol.h"
+#include "server_read_ops.h"
 
 #include <openssl/ssl.h>
 
@@ -20,6 +21,7 @@ typedef struct {
     const char* cert_path;
     const char* key_path;
     const char* data_dir;
+    const char* auth_db_path;
     int timeout_sec;
 } server_config_t;
 
@@ -28,6 +30,7 @@ typedef struct {
     SSL_CTX* ssl_ctx;
     int sock;
     const server_config_t* config;
+    server_config_t config_storage; /* worker-owned copy, including data/auth paths */
 } client_context_t;
 
 /* Function prototypes */
@@ -35,7 +38,9 @@ server_config_t* parse_args(int argc, const char** argv);
 SSL_CTX* init_ssl(const server_config_t* config);
 int setup_tcp_socket(const server_config_t* config);
 void* handle_client(void* arg);
-error_code_t handle_request(SSL* ssl, const server_config_t* config);
+void release_client_context(client_context_t *ctx);
+/* Owns the entire response, including legacy write final status. */
+server_read_result_t handle_request(SSL* ssl, const server_config_t* config);
 error_code_t handle_upload(SSL* ssl, const server_config_t* config);
 error_code_t handle_delete(SSL* ssl, const server_config_t* config);
 void shutdown_server(int sig);

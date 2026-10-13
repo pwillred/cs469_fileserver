@@ -3,6 +3,7 @@
 #endif
 #include "server_read_ops.h"
 #include "server_auth.h"
+#include "server_protocol_fields.h"
 #include <openssl/crypto.h>
 #include <dirent.h>
 #include <errno.h>
@@ -17,34 +18,13 @@ static server_read_result_t failed(const server_read_io_t *io) {
     if (io && io->abort) io->abort(io->state);
     return (server_read_result_t){ERR_INTERNAL, 0};
 }
-static int status_byte(const server_read_io_t *io, error_code_t status) {
-    uint8_t byte;
-    switch (status) {
-        case ERR_OK: byte = 0; break;
-        case ERR_AUTH_FAILED: byte = 1; break;
-        case ERR_NOT_FOUND: byte = 2; break;
-        case ERR_EXISTS: byte = 3; break;
-        case ERR_BAD_REQUEST: byte = 4; break;
-        case ERR_TOO_LARGE: byte = 5; break;
-        case ERR_REPLICATION_FAILED: byte = 6; break;
-        default: byte = 7; break;
-    }
-    return io->write_all(io->state, &byte, 1);
-}
 static server_read_result_t error_response(const server_read_io_t *io, error_code_t status) {
-    if (status_byte(io, status) != 0) return failed(io);
+    if (server_write_status(io, status) != 0) return failed(io);
     return (server_read_result_t){status, 1};
 }
 static int number(const server_read_io_t *io, uint32_t n) {
     uint8_t b[4] = {(uint8_t)(n >> 24), (uint8_t)(n >> 16), (uint8_t)(n >> 8), (uint8_t)n};
     return io->write_all(io->state, b, sizeof(b));
-}
-static size_t field(const server_read_io_t *io, char *out, size_t capacity) {
-    for (size_t i = 0; i < capacity; ++i) {
-        if (io->read_exact(io->state, out + i, 1) != 0) return 0;
-        if (out[i] == 0) return i + 1;
-    }
-    return 0;
 }
 static int valid_name(const char *name) {
     size_t n = strnlen(name, MAX_FILENAME_LEN + 1);
@@ -60,9 +40,9 @@ static error_code_t credentials(const server_read_io_t *io, const server_read_co
                                  char user[65], char *name) {
     char password[65] = {0};
     error_code_t status = ERR_BAD_REQUEST;
-    size_t u = field(io, user, 65), p = 0;
-    if (u) p = field(io, password, sizeof(password));
-    if (!u || !p || (name && !field(io, name, MAX_FILENAME_LEN + 1))) goto done;
+    size_t u = server_read_field(io, user, 65), p = 0;
+    if (u) p = server_read_field(io, password, sizeof(password));
+    if (!u || !p || (name && !server_read_field(io, name, MAX_FILENAME_LEN + 1))) goto done;
     status = server_auth_to_error(server_auth_verify(ctx->auth_db_path, user, u, password, p));
     if (status == ERR_OK && name && !valid_name(name)) status = ERR_BAD_REQUEST;
 done:
@@ -124,7 +104,7 @@ server_read_result_t server_handle_list(const server_read_io_t *io, const server
     if (status != ERR_OK) result = error_response(io, status);
     else {
         if (count > 1) qsort(names, count, sizeof(*names), compare_names);
-        int bad = status_byte(io, ERR_OK) != 0;
+        int bad = server_write_status(io, ERR_OK) != 0;
         if (!bad) bad = number(io, (uint32_t)count) != 0;
         for (size_t i = 0; !bad && i < count; ++i)
             bad = io->write_all(io->state, names[i], strlen(names[i]) + 1) != 0;
@@ -154,7 +134,7 @@ server_read_result_t server_handle_download(const server_read_io_t *io, const se
     else if ((uintmax_t)st.st_size > UINT32_MAX) status = ERR_TOO_LARGE;
     if (status != ERR_OK) { close(fd); return error_response(io, status); }
     uint32_t remaining = (uint32_t)st.st_size;
-    int bad = status_byte(io, ERR_OK) != 0;
+    int bad = server_write_status(io, ERR_OK) != 0;
     if (!bad) bad = number(io, remaining) != 0;
     unsigned char buffer[16384];
     while (!bad && remaining) {
