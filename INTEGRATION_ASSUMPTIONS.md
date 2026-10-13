@@ -18,6 +18,39 @@ commands implement these messages; the transport module remains byte-oriented.
   and deletions. Credential DBs are not file-replication payloads. Independent
   salts/hashes need not match byte-for-byte.
 
+## Server authentication hook (module implemented, integration pending)
+
+`server_auth.h` exposes `server_auth_verify(db_path, username, username_size,
+password, password_size)` and `server_auth_to_error`. Sizes are decoded byte counts
+including the final NUL, not padded array capacities. Credentials must be 1–64
+characters; usernames follow DB policy `[A-Za-z0-9_-]`, and passwords use printable
+ASCII. The module rejects malformed/nonterminated spans and cleanses the supplied
+password span even on failure, without copying plaintext. The future caller must
+also cleanse unused buffer capacity and parsing-error paths.
+
+Each call owns a separate read-only, open-existing DB handle. No authentication
+call creates a database or initializes schema. Existing admin behavior is unchanged;
+accounts/changes/deletions remain manually provisioned in each node's local DB.
+
+| Verification outcome | Auth result | Network error |
+| --- | --- | --- |
+| PASSWORD_DB_OK | SERVER_AUTH_OK | ERR_OK |
+| USER_NOT_FOUND or PASSWORD_MISMATCH | SERVER_AUTH_FAILED | ERR_AUTH_FAILED |
+| Malformed input detected before DB access | SERVER_AUTH_BAD_REQUEST | ERR_BAD_REQUEST |
+| Open/schema/SQLite/crypto/memory/algorithm/record failure or unexpected result | SERVER_AUTH_INTERNAL | ERR_INTERNAL |
+
+DB INVALID_ARGUMENT after the module's input validation is an internal contract
+failure; malformed client input has already returned BAD_REQUEST. Never apply the
+old boolean convention: auth success is zero. Unknown auth enums map to ERR_INTERNAL.
+
+Future startup should add `--auth-db users.db` and `server_config_t.auth_db_path`.
+The path and parent directories must be administrator-controlled, and its storage
+must outlive worker use. Startup must not provision an empty replacement DB.
+Future `read_and_verify_credentials()` integration must decode the frozen bounded
+NUL-terminated fields, call the new API and explicitly map its result. It cannot
+safely reuse the current unchecked fixed-width reader. No startup, worker-lifetime,
+request-parser or legacy-stub changes are included in this isolated module chunk.
+
 ## Encoding
 
 Commands are the ASCII verb bytes shown below, without fixed-width padding.
