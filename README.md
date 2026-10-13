@@ -4,8 +4,9 @@ A CS469 Distributed Systems project at Regis University by Fedil Grogan and
 Brian Leake. The target is a secure file service with a CLI client, a primary
 server, and a read-only replica. **The distributed service is not complete:**
 local credential administration and client configuration/password input work;
-server authentication, read operations, replication, and client networking are
-not integrated in this checkout.
+server authentication, read operations, replication, and client command networking
+are not integrated in this checkout. Verified TLS transport primitives are available
+separately and tested with local fixtures.
 
 ## Project Overview
 
@@ -58,9 +59,11 @@ The admin CLI and client prompt hide input and cleanse temporary password buffer
 password command-line arguments are deliberately prohibited.
 
 The server loads a TLS certificate/key, but real user authentication and per-user
-isolation still need integration. Client TLS certificate/hostname verification
-and primary-to-replica mTLS remain planned. The CA configuration key currently records a path
-only; it does not load or trust a certificate. There is no insecure client mode.
+isolation still need integration. The reusable client transport verifies CA trust
+and DNS/IP identity with TLS 1.2 or newer. Primary-to-replica mTLS remains planned.
+The CA configuration key currently records a path
+only; the CLI does not connect yet. The transport API loads that CA when explicitly
+called. There is no insecure client mode.
 
 ## Repository Layout
 
@@ -72,6 +75,8 @@ only; it does not load or trust a certificate. There is no insecure client mode.
 | `client_config.c`, `client_config.h` | CLI parsing and deployment configuration loading |
 | `client.conf.example` | Placeholder topology and CA configuration |
 | `client_password.c`, `client_password.h` | Secure single-password terminal input |
+| `client_transport.c`, `client_transport.h` | Verified TCP/TLS connection and exact I/O primitives |
+| `INTEGRATION_ASSUMPTIONS.md` | Working wire contract and current scaffold conflicts |
 | `server.c`, `server.h` | TLS/TCP startup, configuration, detached connection threads |
 | `server_ops.c` | Dispatch, local writes, authentication/read stubs |
 | `server_util.c` | TLS I/O and filesystem-path helpers |
@@ -80,6 +85,7 @@ only; it does not load or trust a certificate. There is no insecure client mode.
 | `tests/test_password_db.c` | Database and account-management tests |
 | `tests/test_client_config.c` | CLI and configuration-file tests |
 | `tests/test_client_password.c` | Pseudo-terminal password/cleanup tests |
+| `tests/test_client_transport.c` | Loopback TLS, trust, identity, I/O and cleanup tests |
 | `Makefile`, `.gitignore` | Server build and C artifact ignores |
 
 ## Dependencies
@@ -116,6 +122,8 @@ cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
 cc $CFLAGS -o "$BUILD_DIR/test_client_config" tests/test_client_config.c client_config.c
 cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
   -o "$BUILD_DIR/test_client_password" tests/test_client_password.c client_password.c -lcrypto -lutil
+cc $CFLAGS $OPENSSL_CFLAGS $OPENSSL_LDFLAGS \
+  -o "$BUILD_DIR/test_client_transport" tests/test_client_transport.c client_transport.c -lssl -lcrypto -lpthread
 ```
 
 The existing Makefile builds **only `server`**; it has no admin, client or test
@@ -240,7 +248,8 @@ change the scaffold's 64-byte protocol constant. Input is never silently truncat
 | UPLOAD / DELETE | Local filesystem paths only |
 | Replication / prepare-commit / mTLS | Not implemented in this checkout |
 | Primary/replica role enforcement | Pending |
-| Client TLS/network execution | Pending |
+| Client TLS transport primitives | Implemented separately; verified connections and exact I/O |
+| Client file-service command execution | Pending; CLI still does not connect |
 | Read failover | Pending |
 
 ## Testing
@@ -251,6 +260,7 @@ After the direct builds above:
 "$BUILD_DIR/test_password_db"
 "$BUILD_DIR/test_client_config"
 "$BUILD_DIR/test_client_password"
+"$BUILD_DIR/test_client_transport"
 ```
 
 The database suite creates and removes temporary databases. Configuration tests
@@ -259,6 +269,12 @@ Neither test path uses DNS or a server. Password tests create pseudo-terminals
 and verify hidden
 input, bounds, failure clearing, and terminal restoration after success, EOF and
 SIGINT/SIGTERM/SIGHUP/SIGQUIT. They emit no plaintext test passwords.
+Transport tests need permission to bind loopback sockets; they generate ephemeral
+keys/certificates, remove temporary CA
+files, and require no external server. They exercise certificate trust, DNS/IP
+identity, SNI, buffered/fragmented reads, large writes, EOF and timeouts. A genuine
+partial SSL_write return is not deterministically forced; large multi-write
+payloads cover progress. IPv6 support is implemented but the fixture binds IPv4.
 
 For AddressSanitizer/UndefinedBehaviorSanitizer, append
 `-fsanitize=address,undefined -fno-omit-frame-pointer` to `CFLAGS`, rebuild the desired
@@ -270,7 +286,14 @@ tools/tests with the same commands, and rerun them. No live server is required.
 - Server credential parsing is not yet safe to connect directly to the database API.
 - Replication, role enforcement, final authentication and failover remain incomplete.
 - Credential provisioning is manual on each node; no credential replication exists.
-- The client verifies neither a server nor a password yet and performs no networking.
+- The CLI still performs no networking or password verification; TLS primitives
+  are available to future command code but are not invoked by the CLI.
+- Transport uses one 5-second deadline for TCP attempts plus TLS handshake after
+  resolution, and one deadline per read/write call; a timeout API permits overrides.
+  Synchronous getaddrinfo is not deadline-bounded. Close makes one nonblocking
+  close_notify attempt. Callers must discard a connection after transfer failure.
+- No automatic replica routing or command serialization is implemented. See
+  INTEGRATION_ASSUMPTIONS.md for the working contract and scaffold conflicts.
 - Password entry uses terminal editing conventions: backspace edits, Ctrl-U clears,
   Ctrl-D cancels. Signal controls and flow control retain terminal meanings.
 - Handled termination signals cancel client input after restoration; SIGKILL and
