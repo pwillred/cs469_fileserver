@@ -22,6 +22,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "%s\n%s", error, client_usage());
         return EXIT_FAILURE;
     }
+    if (client_config_load(options.config_path, &options.deployment, &error) != CLIENT_PARSE_OK) {
+        fprintf(stderr, "%s\n", error);
+        return EXIT_FAILURE;
+    }
     char password[CLIENT_PASSWORD_MAX + 1] = {0};
     int password_result = client_read_password("Password: ", password, sizeof(password));
     /* There is no network consumer yet. Discard immediately, on every result. */
