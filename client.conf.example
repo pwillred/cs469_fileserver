@@ -1,0 +1,8 @@
+# Deployment configuration; copy to client.conf and configure for your deployment.
+# Both endpoints stay internal to the client. These are placeholder DNS names.
+primary_host=server1.example
+primary_port=4433
+replica_host=server2.example
+replica_port=4433
+# Relative to the client's working directory, not this file's location.
+ca_file=certs/ca.pem

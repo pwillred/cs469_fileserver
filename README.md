@@ -59,7 +59,7 @@ password command-line arguments are deliberately prohibited.
 
 The server loads a TLS certificate/key, but real user authentication and per-user
 isolation still need integration. Client TLS certificate/hostname verification
-and primary-to-replica mTLS remain planned. The CA option currently records a path
+and primary-to-replica mTLS remain planned. The CA configuration key currently records a path
 only; it does not load or trust a certificate. There is no insecure client mode.
 
 ## Repository Layout
@@ -69,7 +69,8 @@ only; it does not load or trust a certificate. There is no insecure client mode.
 | `admin.c` | Local account administration |
 | `password_db.c`, `password_db.h` | SQLite lifecycle, hashing, verification, account management |
 | `client.c` | Local CLI entry point; prompts then discards password |
-| `client_config.c`, `client_config.h` | Argument parsing and endpoint/trust configuration |
+| `client_config.c`, `client_config.h` | CLI parsing and deployment configuration loading |
+| `client.conf.example` | Placeholder topology and CA configuration |
 | `client_password.c`, `client_password.h` | Secure single-password terminal input |
 | `server.c`, `server.h` | TLS/TCP startup, configuration, detached connection threads |
 | `server_ops.c` | Dispatch, local writes, authentication/read stubs |
@@ -77,7 +78,7 @@ only; it does not load or trust a certificate. There is no insecure client mode.
 | `protocol.h`, `password.h` | Scaffold protocol constants and legacy verifier declaration |
 | `cert_gen.sh` | Generates a self-signed primary test certificate/key |
 | `tests/test_password_db.c` | Database and account-management tests |
-| `tests/test_client_config.c` | Pure argument-parser tests |
+| `tests/test_client_config.c` | CLI and configuration-file tests |
 | `tests/test_client_password.c` | Pseudo-terminal password/cleanup tests |
 | `Makefile`, `.gitignore` | Server build and C artifact ignores |
 
@@ -171,15 +172,40 @@ credentials until authentication integration is implemented.
 ## Client Usage
 
 ```sh
-"$BUILD_DIR/client" \
-  --primary-host primary.example --primary-port 8443 \
-  --replica-host replica.example --replica-port 8444 \
-  --ca ca.pem --username alice \
-  list
+"$BUILD_DIR/client" --username alice list
+# Or select a deployment configuration explicitly:
+"$BUILD_DIR/client" --config custom-client.conf --username alice list
 ```
 
-All six options are required before the lowercase command; there are no endpoint
-defaults. Ports are decimal 1–65535. Command operands are:
+The user addresses one logical file service, not an individual physical server.
+Deployment topology belongs in configuration. Copy `client.conf.example` to
+`client.conf` and supply deployment-appropriate values. The default `client.conf`
+is relative to the client's current working directory; `--config FILE` overrides
+it. An example (placeholder names only):
+
+```ini
+primary_host=server1.example
+primary_port=4433
+replica_host=server2.example
+replica_port=4433
+ca_file=certs/ca.pem
+```
+
+All five keys are required. Blank lines and lines beginning with `#` after trimming
+are allowed; whitespace around keys/values is trimmed. Unknown/duplicate/missing
+keys, empty values, malformed lines and invalid ports are errors. Ports are decimal
+1–65535. Hosts are limited to 255 bytes without whitespace/control characters,
+other values to 1023 bytes, and lines to 2048 bytes excluding newline. There is no
+quoting, escaping, inline-comment or environment-substitution syntax; each data
+line must have exactly one `=`. Relative CA paths are relative to the working
+directory, not the configuration file. The loader does not open the CA file.
+
+`--username` is required; options precede the lowercase command. The old
+`--primary-host`, `--primary-port`, `--replica-host`, `--replica-port`, and `--ca`
+CLI options are rejected, as are password options. The client internally retains
+both endpoints. Future LIST/DOWNLOAD failover will be automatic for eligible
+availability failures; UPLOAD/DELETE remain primary-only. Routing, networking and
+failover are still pending. Command operands are:
 
 ```text
 list
@@ -189,13 +215,14 @@ delete REMOTE_NAME
 ```
 
 Local paths must be nonempty; remote names must be nonempty filenames without
-path separators and cannot be `.` or `..`. No files are opened/transferred by the
-client. Use `client --help` for usage.
+path separators and cannot be `.` or `..`. Only the configuration file is read;
+no user files are opened or transferred. Use `client --help` for usage.
 
-After valid parsing, the client prompts **once**, without confirmation, using
-terminal stdin. It accepts up to 4096 bytes locally, rejects empty/overlong input,
+After valid parsing and configuration loading, the client prompts **once**,
+without confirmation, using terminal stdin. It accepts up to 4096 bytes locally, rejects empty/overlong input,
 clears the password immediately, and reports that no network operation occurred.
-Help and invalid arguments never prompt. Noninteractive password input is rejected.
+Help, invalid arguments, and missing/invalid configuration never prompt.
+Noninteractive password input is rejected.
 The final wire password limit remains unresolved; this local limit does not
 change the scaffold's 64-byte protocol constant. Input is never silently truncated.
 
@@ -226,8 +253,10 @@ After the direct builds above:
 "$BUILD_DIR/test_client_password"
 ```
 
-The database suite creates and removes temporary databases. Parser tests require
-no files, DNS or server. Password tests create pseudo-terminals and verify hidden
+The database suite creates and removes temporary databases. Configuration tests
+create and remove a temporary config file; pure CLI parsing requires no files.
+Neither test path uses DNS or a server. Password tests create pseudo-terminals
+and verify hidden
 input, bounds, failure clearing, and terminal restoration after success, EOF and
 SIGINT/SIGTERM/SIGHUP/SIGQUIT. They emit no plaintext test passwords.
 
