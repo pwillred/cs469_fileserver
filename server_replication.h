@@ -16,4 +16,7 @@
 SSL_CTX* init_replication_ssl(const server_config_t* config);
 void* replication_handler(void* arg);
 
+error_code_t handle_upload_replica(SSL* ssl, const server_config_t* config);
+error_code_t handle_delete_replica(SSL* ssl, const server_config_t* config);
+
 #endif /* SERVER_REPLICATION_H */

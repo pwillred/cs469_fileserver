@@ -8,7 +8,11 @@
 
 #include "server_replication.h"
 #include "protocol.h"
+#include "server_auth.h"
+#include "server.h"
+#include "server_protocol_fields.h"
 #include <openssl/err.h>
+#include <openssl/crypto.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -17,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 typedef struct {
@@ -34,7 +39,196 @@ static void release_replication_context(replication_context_t* ctx) {
     free(ctx);
 }
 
-server_read_result_t replication_handle_upload(SSL* ssl, const server_config_t* config);
+typedef struct {
+    char username[MAX_USERNAME_LEN + 1];
+    char filename[MAX_FILENAME_LEN + 1];
+    uint32_t file_size;
+    SSL* ssl;
+} upload_context_t;
+
+typedef struct {
+    char username[MAX_USERNAME_LEN + 1];
+    char filename[MAX_FILENAME_LEN + 1];
+    SSL* ssl;
+} delete_context_t;
+
+static int read_null_terminated(SSL* ssl, char* buf, size_t max_len) {
+    size_t i = 0;
+    while (i < max_len) {
+        ssize_t n = SSL_read(ssl, &buf[i], 1);
+        if (n <= 0) return -1;
+        if (buf[i] == '\0') return 0;
+        i++;
+    }
+    return -1;
+}
+
+static int read_uint32_be(SSL* ssl, uint32_t* out) {
+    uint8_t bytes[4];
+    if (SSL_read(ssl, bytes, 4) != 4) return -1;
+    *out = (uint32_t)(bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3];
+    return 0;
+}
+
+static char* make_temp_filename(const char* data_dir, const char* username, const char* filename) {
+    size_t len = strlen(data_dir) + 1 + strlen(username) + 1 + 14 + 8 + 1 + strlen(filename) + 1;
+    char* path = malloc(len);
+    if (!path) return NULL;
+    snprintf(path, len, "%s/%s/.temp_%08x_%s", data_dir, username, rand() & 0xFFFFFFFF, filename);
+    return path;
+}
+
+error_code_t handle_upload_replica(SSL* ssl, const server_config_t* config) {
+    char username[MAX_USERNAME_LEN + 1] = {0};
+    char filename[MAX_FILENAME_LEN + 1] = {0};
+    uint32_t file_size = 0;
+    char temp_path[512] = {0};
+    
+    if (read_null_terminated(ssl, username, MAX_USERNAME_LEN) != 0) return ERR_BAD_REQUEST;
+    if (read_uint32_be(ssl, &file_size) != 0) return ERR_BAD_REQUEST;
+    if (read_null_terminated(ssl, filename, MAX_FILENAME_LEN) != 0) return ERR_BAD_REQUEST;
+    
+    if (!validate_filename(filename)) return ERR_BAD_REQUEST;
+    if (file_size > MAX_FILE_SIZE) return ERR_TOO_LARGE;
+    
+    char* user_dir = get_user_dir(username, config->data_dir);
+    if (!user_dir) return ERR_INTERNAL;
+    
+    struct stat st;
+    if (stat(user_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
+        char file_path[512];
+        snprintf(file_path, sizeof(file_path), "%s/%s", user_dir, filename);
+        if (stat(file_path, &st) == 0 && S_ISREG(st.st_mode)) {
+            free(user_dir);
+            return ERR_EXISTS;
+        }
+    }
+    
+    char* temp_path_ptr = make_temp_filename(config->data_dir, username, filename);
+    if (!temp_path_ptr) {
+        free(user_dir);
+        return ERR_INTERNAL;
+    }
+    strncpy(temp_path, temp_path_ptr, sizeof(temp_path) - 1);
+    temp_path[sizeof(temp_path) - 1] = '\0';
+    free(temp_path_ptr);
+    
+    int fd = open(temp_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        free(user_dir);
+        return ERR_INTERNAL;
+    }
+    
+    size_t remaining = file_size;
+    uint8_t buffer[16384];
+    while (remaining > 0) {
+        size_t to_read = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+        ssize_t n = SSL_read(ssl, buffer, to_read);
+        if (n <= 0) {
+            close(fd);
+            unlink(temp_path);
+            free(user_dir);
+            return ERR_BAD_REQUEST;
+        }
+        ssize_t written = write(fd, buffer, n);
+        if (written < 0) {
+            close(fd);
+            unlink(temp_path);
+            free(user_dir);
+            return ERR_INTERNAL;
+        }
+        remaining -= (size_t)written;
+    }
+    
+    if (close(fd) < 0) {
+        unlink(temp_path);
+        free(user_dir);
+        return ERR_INTERNAL;
+    }
+    
+    uint8_t prepare_ok = PREPARE_OK;
+    if (SSL_write(ssl, &prepare_ok, 1) != 1) {
+        unlink(temp_path);
+        free(user_dir);
+        return ERR_REPLICATION_FAILED;
+    }
+    
+    uint8_t commit_byte;
+    if (SSL_read(ssl, &commit_byte, 1) != 1) {
+        unlink(temp_path);
+        free(user_dir);
+        return ERR_REPLICATION_FAILED;
+    }
+    
+    error_code_t result = ERR_OK;
+    if (commit_byte == COMMIT) {
+        char final_path[512];
+        snprintf(final_path, sizeof(final_path), "%s/%s", user_dir, filename);
+        if (rename(temp_path, final_path) < 0) {
+            result = ERR_INTERNAL;
+        }
+        uint8_t confirm = result == ERR_OK ? 0 : 1;
+        if (SSL_write(ssl, &confirm, 1) != 1) result = ERR_REPLICATION_FAILED;
+    } else {
+        unlink(temp_path);
+        uint8_t confirm = 0;
+        (void)SSL_write(ssl, &confirm, 1);
+    }
+    
+    free(user_dir);
+    return result;
+}
+
+error_code_t handle_delete_replica(SSL* ssl, const server_config_t* config) {
+    char username[MAX_USERNAME_LEN + 1] = {0};
+    char filename[MAX_FILENAME_LEN + 1] = {0};
+    
+    if (read_null_terminated(ssl, username, MAX_USERNAME_LEN) != 0) return ERR_BAD_REQUEST;
+    if (read_null_terminated(ssl, filename, MAX_FILENAME_LEN) != 0) return ERR_BAD_REQUEST;
+    
+    if (!validate_filename(filename)) return ERR_BAD_REQUEST;
+    
+    char* user_dir = get_user_dir(username, config->data_dir);
+    if (!user_dir) return ERR_INTERNAL;
+    
+    char file_path[512];
+    snprintf(file_path, sizeof(file_path), "%s/%s", user_dir, filename);
+    
+    struct stat st;
+    if (stat(file_path, &st) < 0 || !S_ISREG(st.st_mode)) {
+        free(user_dir);
+        uint8_t not_found = ERR_NOT_FOUND;
+        (void)SSL_write(ssl, &not_found, 1);
+        return ERR_NOT_FOUND;
+    }
+    
+    uint8_t ready = PREPARE_OK;
+    if (SSL_write(ssl, &ready, 1) != 1) {
+        free(user_dir);
+        return ERR_REPLICATION_FAILED;
+    }
+    
+    uint8_t commit_byte;
+    if (SSL_read(ssl, &commit_byte, 1) != 1) {
+        free(user_dir);
+        return ERR_REPLICATION_FAILED;
+    }
+    
+    error_code_t result = ERR_OK;
+    if (commit_byte == COMMIT) {
+        if (unlink(file_path) < 0) {
+            result = ERR_INTERNAL;
+        }
+        uint8_t confirm = result == ERR_OK ? 0 : 1;
+        if (SSL_write(ssl, &confirm, 1) != 1) result = ERR_REPLICATION_FAILED;
+    } else {
+        uint8_t confirm = 0;
+        (void)SSL_write(ssl, &confirm, 1);
+    }
+    
+    free(user_dir);
+    return result;
+}
 
 static void* do_replication_handler(void* arg) {
     replication_context_t* ctx = (replication_context_t*)arg;
@@ -46,12 +240,29 @@ static void* do_replication_handler(void* arg) {
         !ssl || SSL_set_fd(ssl, ctx->sock) != 1 || SSL_accept(ssl) <= 0) {
         fprintf(stderr, "Failed to establish TLS connection for replication\n");
     } else {
-        server_read_result_t result = replication_handle_upload(ssl, ctx->config);
-        if (result.complete) {
-            (void)SSL_shutdown(ssl);
+        uint8_t cmd_buf[8];
+        ssize_t n = SSL_read(ssl, cmd_buf, 6);
+        if (n != 6) {
+            fprintf(stderr, "Failed to read replication command\n");
         } else {
-            fprintf(stderr, "Replication request ended with incomplete response\n");
-            (void)shutdown(ctx->sock, SHUT_RDWR);
+            cmd_buf[n] = '\0';
+            error_code_t status = ERR_INTERNAL;
+            
+            if (strcmp((char*)cmd_buf, UPLOAD_CMD) == 0) {
+                status = handle_upload_replica(ssl, ctx->config);
+            } else if (strcmp((char*)cmd_buf, DELETE_CMD) == 0) {
+                status = handle_delete_replica(ssl, ctx->config);
+            } else {
+                fprintf(stderr, "Unknown replication command: %s\n", cmd_buf);
+                status = ERR_BAD_REQUEST;
+            }
+            
+            if (status != ERR_OK) {
+                uint8_t err_byte = server_status_byte(status);
+                if (SSL_write(ssl, &err_byte, 1) != 1) {
+                    fprintf(stderr, "Failed to send error response\n");
+                }
+            }
         }
     }
 
@@ -166,14 +377,4 @@ void* replication_handler(void* arg) {
     return NULL;
 }
 
-server_read_result_t replication_handle_upload(SSL* ssl, const server_config_t* config) {
-    (void)ssl;
-    (void)config;
 
-    uint8_t prepare_response = 7;
-    if (write_fully(ssl, &prepare_response, 1) != 0) {
-        return (server_read_result_t){.status = ERR_INTERNAL, .complete = 0};
-    }
-
-    return (server_read_result_t){.status = ERR_INTERNAL, .complete = 1};
-}
