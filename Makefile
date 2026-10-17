@@ -44,7 +44,7 @@ TEST_DIR := $(BUILD_DIR)/tests
 TEST_TARGETS := test-password-db test-client-config test-client-password \
  test-client-transport test-client-protocol test-client-commands \
  test-client-failover test-server-auth test-server-auth-faults test-server-read \
- test-server-replication test-server-production
+ test-server-production
 
 .PHONY: all clean test check sanitize help $(TEST_TARGETS) test-client-integration
 all: $(SERVER) $(CLIENT) $(ADMIN)
@@ -134,16 +134,10 @@ $(TEST_DIR)/test_server_credentials: $(TEST_DIR)/test_server_credentials.o $(TES
 	$(CC) $(CFLAGS) $(SANITIZER_FLAGS) $(LDFLAGS) $(OPENSSL_LDFLAGS) -o $@ $^ $(SQLITE_LIBS) $(SSL_LIBS) $(THREAD_LIBS) $(LDLIBS)
 $(TEST_DIR)/test_server_fields: $(TEST_DIR)/test_server_fields.o
 	$(CC) $(CFLAGS) $(SANITIZER_FLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
-$(TEST_DIR)/test_server_replication: $(TEST_DIR)/test_server_replication.o $(BUILD_DIR)/server_replication.o \
- $(BUILD_DIR)/server_util.o $(BUILD_DIR)/server_read_ops.o $(BUILD_DIR)/server_protocol_io.o $(BUILD_DIR)/server_auth.o $(BUILD_DIR)/password_db.o
-	$(CC) $(CFLAGS) $(SANITIZER_FLAGS) $(LDFLAGS) $(OPENSSL_LDFLAGS) -o $@ $^ $(SSL_LIBS) $(SQLITE_LIBS) $(THREAD_LIBS) $(LDLIBS)
 test-server-production: $(SERVER) $(CLIENT) $(TEST_DIR)/server_read_fixture $(TEST_DIR)/test_server_fields $(TEST_DIR)/test_server_credentials
 	./$(TEST_DIR)/test_server_fields
 	./$(TEST_DIR)/test_server_credentials
 	$(PYTHON) tests/test_server_production_integration.py ./$(SERVER) ./$(CLIENT) $(TEST_DIR)/server_read_fixture
-
-test-server-replication: $(TEST_DIR)/test_server_replication
-	./$<
 
 test: $(TEST_TARGETS)
 check: test

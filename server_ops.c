@@ -153,6 +153,17 @@ error_code_t handle_upload(SSL* ssl, const server_config_t* config) {
     fclose(f);
     free(buf);
     
+    if (!config->peer_cert_path) {
+        char final_path[512];
+        snprintf(final_path, sizeof(final_path), "%s/%s", user_dir, filename);
+        if (rename(temp_path, final_path) < 0) {
+            free(user_dir);
+            return ERR_INTERNAL;
+        }
+        free(user_dir);
+        return ERR_OK;
+    }
+    
     SSL* replica_ssl = connect_to_replica(config);
     if (!replica_ssl) {
         unlink(temp_path);
@@ -253,6 +264,15 @@ error_code_t handle_delete(SSL* ssl, const server_config_t* config) {
     if (stat(file_path, &st) < 0 || !S_ISREG(st.st_mode)) {
         free(user_dir);
         return ERR_NOT_FOUND;
+    }
+    
+    if (!config->peer_cert_path) {
+        if (unlink(file_path) < 0) {
+            free(user_dir);
+            return ERR_INTERNAL;
+        }
+        free(user_dir);
+        return ERR_OK;
     }
     
     SSL* replica_ssl = connect_to_replica(config);
