@@ -66,4 +66,13 @@ char* get_user_dir(const char* username, const char* data_dir);
 error_code_t read_and_verify_credentials(SSL* ssl, const server_config_t* config, char *username);
 error_code_t read_filename(SSL *ssl, const server_config_t *config, char *filename);
 
+SSL* connect_to_replica(const server_config_t* config);
+error_code_t send_upload_replication_header(SSL* ssl, const char* username, 
+                                            uint32_t file_size, const char* filename);
+error_code_t send_delete_replication_header(SSL* ssl, const char* username, const char* filename);
+error_code_t send_file_data(SSL* ssl, const char* temp_path, uint32_t file_size);
+error_code_t read_replica_response(SSL* ssl, uint8_t* response);
+int send_commit_byte(SSL* ssl, uint8_t commit_byte);
+error_code_t read_confirmation(SSL* ssl, uint8_t* confirm);
+
 #endif /* SERVER_H */
