@@ -30,7 +30,7 @@ BUILD_DIR := build/normal
 PROGRAM_PREFIX :=
 endif
 
-SERVER_SRC := server.c server_ops.c server_util.c server_auth.c password_db.c server_read_ops.c server_protocol_io.c
+SERVER_SRC := server.c server_ops.c server_util.c server_auth.c server_replication.c password_db.c server_read_ops.c server_protocol_io.c
 CLIENT_SRC := client.c client_config.c client_password.c client_transport.c client_protocol.c client_commands.c
 ADMIN_SRC := admin.c password_db.c
 SERVER_OBJS := $(addprefix $(BUILD_DIR)/,$(SERVER_SRC:.c=.o))
@@ -58,6 +58,7 @@ $(ADMIN): $(ADMIN_OBJS)
 
 $(BUILD_DIR)/%.o: %.c Makefile
 	@mkdir -p "$(@D)"
+	@echo "Using custom rule for $< -> $@"
 	$(CC) $(CPPFLAGS) $(PROJECT_CPPFLAGS) $(CFLAGS) $(SANITIZER_FLAGS) -MMD -MP -c $< -o $@
 
 # These substitutions apply only to dedicated test objects, never production.

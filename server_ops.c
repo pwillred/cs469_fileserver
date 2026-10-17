@@ -21,10 +21,10 @@
 void release_client_context(client_context_t *ctx) {
     SSL_CTX_free(ctx->ssl_ctx);
     close(ctx->sock);
-    free((void *)ctx->config_storage.cert_path);
-    free((void *)ctx->config_storage.key_path);
-    free((void *)ctx->config_storage.data_dir);
-    free((void *)ctx->config_storage.auth_db_path);
+    free((void*)ctx->config_storage.cert_path);
+    free((void*)ctx->config_storage.key_path);
+    free((void*)ctx->config_storage.data_dir);
+    free((void*)ctx->config_storage.auth_db_path);
     free(ctx);
 }
 
@@ -78,8 +78,20 @@ server_read_result_t handle_request(SSL* ssl, const server_config_t* config) {
     if (selected == 0) return server_handle_list(&io, &read_context);
     if (selected == 2) return server_handle_download(&io, &read_context);
     error_code_t status = ERR_BAD_REQUEST;
-    if (selected == 1) status = handle_upload(ssl, config);
-    if (selected == 3) status = handle_delete(ssl, config);
+    if (selected == 1) {
+        if (config->role == ROLE_REPLICA) {
+            status = ERR_REPLICATION_FAILED;
+        } else {
+            status = handle_upload(ssl, config);
+        }
+    }
+    if (selected == 3) {
+        if (config->role == ROLE_REPLICA) {
+            status = ERR_REPLICATION_FAILED;
+        } else {
+            status = handle_delete(ssl, config);
+        }
+    }
     /* Legacy writes retain one final status, never a fabricated preliminary OK.
      * Their helpers retain per-call timeouts, so don't reuse the command deadline. */
     int sent = selected == 1 || selected == 3 ? send_error(ssl, status) : server_write_status(&io, status);

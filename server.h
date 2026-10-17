@@ -9,11 +9,18 @@
 #define SERVER_H
 
 #define DEFAULT_TIMEOUT 15
+#define DEFAULT_REPLICATION_PORT 8081
 
 #include "protocol.h"
 #include "server_read_ops.h"
 
 #include <openssl/ssl.h>
+
+/* Server role enum */
+typedef enum {
+    ROLE_PRIMARY,
+    ROLE_REPLICA
+} server_role_t;
 
 /* Server configuration */
 typedef struct {
@@ -23,6 +30,10 @@ typedef struct {
     const char* data_dir;
     const char* auth_db_path;
     int timeout_sec;
+    server_role_t role;
+    int replication_port;
+    const char* coordinator_name;
+    const char* peer_cert_path;
 } server_config_t;
 
 /* Client context passed to handler thread */
@@ -36,7 +47,9 @@ typedef struct {
 /* Function prototypes */
 server_config_t* parse_args(int argc, const char** argv);
 SSL_CTX* init_ssl(const server_config_t* config);
-int setup_tcp_socket(const server_config_t* config);
+SSL_CTX* init_replication_ssl(const server_config_t* config);
+void* replication_handler(void* arg);
+int setup_tcp_socket(int port);
 void* handle_client(void* arg);
 void release_client_context(client_context_t *ctx);
 /* Owns the entire response, including legacy write final status. */
