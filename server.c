@@ -28,6 +28,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+/* Global config struct - we only need one, and having it be free()d is challenging - what if worker threads outlast main? */
+static server_config_t config;
+
 static int positive_number(const char *text, int maximum) {
     if (!text || !*text) return 0;
     for (const char *p = text; *p; ++p) if (*p < '0' || *p > '9') return 0;
@@ -38,69 +41,59 @@ static int positive_number(const char *text, int maximum) {
 }
 
 server_config_t* parse_args(int argc, const char** argv) {
-    server_config_t* config = calloc(1, sizeof(server_config_t));
-    if (!config) {
-        fprintf(stderr, "Failed to allocate config\n");
-        return NULL;
-    }
-   
-    config->timeout_sec = DEFAULT_TIMEOUT;
-    config->role = ROLE_PRIMARY;
-    config->replication_port = DEFAULT_REPLICATION_PORT;
-    config->coordinator_name = "primary.localhost";
-    config->peer_cert_path = NULL;
+    config.timeout_sec = DEFAULT_TIMEOUT;
+    config.role = ROLE_PRIMARY;
+    config.replication_port = DEFAULT_REPLICATION_PORT;
+    config.coordinator_name = "primary.localhost";
+    config.peer_cert_path = NULL;
    
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-            config->port = positive_number(argv[++i], 65535);
+            config.port = positive_number(argv[++i], 65535);
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-            config->cert_path = argv[++i];
+            config.cert_path = argv[++i];
         } else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
-            config->key_path = argv[++i];
+            config.key_path = argv[++i];
         } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
-            config->data_dir = argv[++i];
+            config.data_dir = argv[++i];
         } else if (strcmp(argv[i], "--auth-db") == 0 && i + 1 < argc) {
-            config->auth_db_path = argv[++i];
+            config.auth_db_path = argv[++i];
         } else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
-            config->timeout_sec = positive_number(argv[++i], INT_MAX / 1000);
+            config.timeout_sec = positive_number(argv[++i], INT_MAX / 1000);
         } else if (strcmp(argv[i], "--role") == 0 && i + 1 < argc) {
             const char* role_arg = argv[++i];
             if (strcmp(role_arg, "primary") == 0) {
-                config->role = ROLE_PRIMARY;
+                config.role = ROLE_PRIMARY;
             } else if (strcmp(role_arg, "replica") == 0) {
-                config->role = ROLE_REPLICA;
+                config.role = ROLE_REPLICA;
             } else {
                 fprintf(stderr, "Unknown role: %s\n", role_arg);
-                free(config);
                 return NULL;
             }
         } else if (strcmp(argv[i], "--replication-port") == 0 && i + 1 < argc) {
-            config->replication_port = positive_number(argv[++i], 65535);
+            config.replication_port = positive_number(argv[++i], 65535);
         } else if (strcmp(argv[i], "--coordinator-name") == 0 && i + 1 < argc) {
-            config->coordinator_name = argv[++i];
+            config.coordinator_name = argv[++i];
         } else if (strcmp(argv[i], "--peer-cert") == 0 && i + 1 < argc) {
-            config->peer_cert_path = argv[++i];
+            config.peer_cert_path = argv[++i];
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
-            free(config);
             return NULL;
         }
     }
     
-    if (config->port < 1 || config->port > 65535 || !config->cert_path || !config->key_path || !config->data_dir ||
-        !config->auth_db_path || !*config->auth_db_path || config->timeout_sec < 1 || config->timeout_sec > INT_MAX / 1000) {
+    if (config.port < 1 || config.port > 65535 || !config.cert_path || !config.key_path || !config.data_dir ||
+        !config.auth_db_path || !*config.auth_db_path || config.timeout_sec < 1 || config.timeout_sec > INT_MAX / 1000) {
         fprintf(stderr, "Usage: %s -p port -c cert -k key -d data_dir --auth-db PATH [--timeout seconds] [--role {primary,replica}] [--replication-port port] [--coordinator-name name] [--peer-cert PATH]\n", argv[0]);
-        free(config);
         return NULL;
     }
     
-    if (config->role == ROLE_REPLICA && !config->peer_cert_path) {
+    if (config.role == ROLE_REPLICA && !config.peer_cert_path) {
         fprintf(stderr, "Replica mode requires --peer-cert to verify primary's client certificate\n");
-        free(config);
         return NULL;
     }
     
-    return config;
+    return &config;
 }
 
 SSL_CTX* init_ssl(const server_config_t* config) {
@@ -339,7 +332,6 @@ int main(int argc, const char** argv) {
     }
 
     close(listen_socket);
-    //free(config); - intentional leak, used by child threads.  The OS will clean up.
     
     pthread_exit(0);
     return 0;
