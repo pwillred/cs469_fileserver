@@ -21,10 +21,6 @@
 void release_client_context(client_context_t *ctx) {
     SSL_CTX_free(ctx->ssl_ctx);
     close(ctx->sock);
-    free((void*)ctx->config_storage.cert_path);
-    free((void*)ctx->config_storage.key_path);
-    free((void*)ctx->config_storage.data_dir);
-    free((void*)ctx->config_storage.auth_db_path);
     free(ctx);
 }
 
@@ -37,8 +33,8 @@ void* handle_client(void* arg) {
         !ssl || SSL_set_fd(ssl, ctx->sock) != 1 || SSL_accept(ssl) <= 0) {
         fprintf(stderr, "Failed to establish TLS connection\n");
     } else {
-        server_read_result_t result = handle_request(ssl, ctx->config);
-        if (result.complete) (void)SSL_shutdown(ssl);
+       server_read_result_t result = handle_request(ssl, ctx->config);
+       if (result.complete) (void)SSL_shutdown(ssl);
         else {
             fprintf(stderr, "Request ended with incomplete response\n");
             (void)shutdown(ctx->sock, SHUT_RDWR);

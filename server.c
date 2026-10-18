@@ -263,155 +263,71 @@ int main(int argc, const char** argv) {
         printf("Server listening on port %d\n", config->port);
     }
     fflush(stdout);
-    
-    if (config->role == ROLE_REPLICA) {
-        while (keep_running) {
-            struct pollfd listeners[2] = {{listen_socket, POLLIN, 0}, {replication_socket, POLLIN, 0}};
-            int ready = poll(listeners, 2, 500);
-            if (!keep_running) break;
-            if (ready < 0 && errno == EINTR) continue;
-            if (ready < 0 || listeners[0].revents & (POLLERR | POLLHUP | POLLNVAL) || listeners[1].revents & (POLLERR | POLLHUP | POLLNVAL)) break;
-            if (ready == 0) continue;
+   
+    while (keep_running) {
+        struct pollfd listeners[2] = {{listen_socket, POLLIN, 0}, {replication_socket, POLLIN, 0}};
+        int ready = poll(listeners, 2, 500);
+        if (!keep_running) break;
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0 || listeners[0].revents & (POLLERR | POLLHUP | POLLNVAL) || listeners[1].revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+        if (ready == 0) continue;
             
-            for (int i = 0; i < 2; i++) {
-                if (listeners[i].revents & POLLIN) {
-                    int sock = (i == 0) ? listen_socket : replication_socket;
-                    int client_sock = accept(sock, NULL, NULL);
-                    if (client_sock < 0) {
-                        if (keep_running) fprintf(stderr, "Failed to accept connection\n");
-                        continue;
-                    }
-                    
-                    int client_flags = fcntl(client_sock, F_GETFL);
-                    if (client_flags < 0 || fcntl(client_sock, F_SETFL, client_flags & ~O_NONBLOCK) < 0) {
-                        close(client_sock); continue;
-                    }
-                    
-                    if (i == 0) {
-                        client_context_t* ctx = calloc(1, sizeof(client_context_t));
-                        if (!ctx) {
-                            close(client_sock);
-                            continue;
-                        }
-                        
-                        ctx->sock = client_sock;
-                        ctx->config_storage = *config;
-                        ctx->config_storage.data_dir = strdup(config->data_dir);
-                        ctx->config_storage.auth_db_path = strdup(config->auth_db_path);
-                        ctx->config = &ctx->config_storage;
-                        if (!ctx->config->data_dir || !ctx->config->auth_db_path || SSL_CTX_up_ref(ssl_ctx) != 1) {
-                            release_client_context(ctx);
-                            continue;
-                        }
-                        ctx->ssl_ctx = ssl_ctx;
-                        
-                        pthread_t thread;
-                        pthread_attr_t attr;
-                        pthread_attr_init(&attr);
-                        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-                        
-                        if (pthread_create(&thread, &attr, handle_client, ctx) != 0) {
-                            fprintf(stderr, "Failed to create thread\n");
-                            release_client_context(ctx);
-                        }
-                        
-                        pthread_attr_destroy(&attr);
-                    } else {
-                        server_config_t* config_copy = malloc(sizeof(server_config_t));
-                        if (!config_copy) {
-                            close(client_sock);
-                            continue;
-                        }
-                        
-                        *config_copy = *config;
-                        config_copy->data_dir = strdup(config->data_dir);
-                        config_copy->auth_db_path = strdup(config->auth_db_path);
-
-                        if (!config_copy->data_dir || !config_copy->auth_db_path) {
-                            free(config_copy->data_dir);
-                            free(config_copy->auth_db_path);
-                            free(config_copy);
-                            close(client_sock);
-                            continue;
-                        }
-                        
-                        void* arg = malloc(sizeof(int) + sizeof(server_config_t*));
-                        if (!arg) {
-                            free(config_copy->data_dir);
-                            free(config_copy->auth_db_path);
-                            free(config_copy);
-                            close(client_sock);
-                            continue;
-                        }
-                        
-                        *(int*)arg = client_sock;
-                        *(server_config_t**)((char*)arg + sizeof(int)) = config_copy;
-                        
-                        if (replication_handler(arg) == NULL) {
-                            free(config_copy->data_dir);
-                            free(config_copy->auth_db_path);
-                            free(config_copy);
-                            close(client_sock);
-                            free(arg);
-                        }
-                    }
+        for (int i = 0; i < 2; i++) {
+            if (listeners[i].revents & POLLIN) {
+                int sock = (i == 0) ? listen_socket : replication_socket;
+                int client_sock = accept(sock, NULL, NULL);
+                if (client_sock < 0) {
+                    if (keep_running) fprintf(stderr, "Failed to accept connection\n");
+                    continue;
                 }
-            }
-        }
-    } else {
-        while (keep_running) {
-            struct pollfd listener = {listen_socket, POLLIN, 0};
-            int ready = poll(&listener, 1, 500);
-            if (!keep_running) break;
-            if (ready < 0 && errno == EINTR) continue;
-            if (ready < 0 || (ready > 0 && (listener.revents & (POLLERR | POLLHUP | POLLNVAL)))) break;
-            if (ready == 0) continue;
-            struct sockaddr_in client_addr;
-            socklen_t client_len = sizeof(client_addr);
-            
-            int client_sock = accept(listen_socket, (struct sockaddr*)&client_addr, &client_len);
-            if (client_sock < 0) {
-                if (keep_running) {
-                    fprintf(stderr, "Failed to accept connection\n");
+                  
+                int client_flags = fcntl(client_sock, F_GETFL);
+                if (client_flags < 0 || fcntl(client_sock, F_SETFL, client_flags & ~O_NONBLOCK) < 0) {
+                    close(client_sock); continue;
                 }
-                continue;
-            }
+                    
+                client_context_t* ctx = calloc(1, sizeof(client_context_t));
+                if (!ctx) {
+                     close(client_sock);
+                     break;
+                }
+                      
+                ctx->sock = client_sock;
+                ctx->config = config;
 
-            int client_flags = fcntl(client_sock, F_GETFL);
-            if (client_flags < 0 || fcntl(client_sock, F_SETFL, client_flags & ~O_NONBLOCK) < 0) {
-                close(client_sock); continue;
+		if (i == 0) {
+			if (SSL_CTX_up_ref(ssl_ctx) != 1) {
+				close(client_sock);
+				free(ctx);
+				continue;
+			}
+			ctx->ssl_ctx = ssl_ctx;
+		} else {
+			if (SSL_CTX_up_ref(replication_ssl_ctx) != 1) {
+				close(client_sock);
+				free(ctx);
+				continue;
+			}
+			ctx->ssl_ctx = replication_ssl_ctx;
+		}
+                        
+                pthread_t thread;
+                pthread_attr_t attr;
+                pthread_attr_init(&attr);
+                pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                       
+	        if (i == 0) {
+		    if (pthread_create(&thread, &attr, handle_client, ctx) != 0) {
+                        fprintf(stderr, "Failed to create thread\n");
+		    }
+		} else {
+		    if (pthread_create(&thread, &attr, replication_handler, ctx) != 0) {
+		        fprintf(stderr, "Failed to create thread\n");
+		    }
+		}
+                        
+                pthread_attr_destroy(&attr);
             }
-
-            client_context_t* ctx = calloc(1, sizeof(client_context_t));
-            if (!ctx) {
-                close(client_sock);
-                continue;
-            }
-            
-            ctx->sock = client_sock;
-            ctx->config_storage = *config;
-            ctx->config_storage.cert_path = strdup(config->cert_path);
-            ctx->config_storage.key_path = strdup(config->key_path);
-            ctx->config_storage.data_dir = strdup(config->data_dir);
-            ctx->config_storage.auth_db_path = strdup(config->auth_db_path);
-            ctx->config = &ctx->config_storage;
-                        if (!ctx->config->data_dir || !ctx->config->auth_db_path || SSL_CTX_up_ref(ssl_ctx) != 1) {
-                            release_client_context(ctx);
-                            continue;
-                        }
-            ctx->ssl_ctx = ssl_ctx;
-            
-            pthread_t thread;
-            pthread_attr_t attr;
-            pthread_attr_init(&attr);
-            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-            
-            if (pthread_create(&thread, &attr, handle_client, ctx) != 0) {
-                fprintf(stderr, "Failed to create thread\n");
-                release_client_context(ctx);
-            }
-            
-            pthread_attr_destroy(&attr);
         }
     }
     

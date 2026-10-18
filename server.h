@@ -41,7 +41,6 @@ typedef struct {
     SSL_CTX* ssl_ctx;
     int sock;
     const server_config_t* config;
-    server_config_t config_storage; /* worker-owned copy, including data/auth paths */
 } client_context_t;
 
 /* Function prototypes */

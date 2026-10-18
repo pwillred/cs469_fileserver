@@ -24,34 +24,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-typedef struct {
-    SSL_CTX* ssl_ctx;
-    int sock;
-    const server_config_t* config;
-} replication_context_t;
-
-static void release_replication_context(replication_context_t* ctx) {
-    SSL_CTX_free(ctx->ssl_ctx);
-    close(ctx->sock);
-    free((void*)ctx->config->data_dir);
-    free((void*)ctx->config->auth_db_path);
-    free(ctx->config);
-    free(ctx);
-}
-
-typedef struct {
-    char username[MAX_USERNAME_LEN + 1];
-    char filename[MAX_FILENAME_LEN + 1];
-    uint32_t file_size;
-    SSL* ssl;
-} upload_context_t;
-
-typedef struct {
-    char username[MAX_USERNAME_LEN + 1];
-    char filename[MAX_FILENAME_LEN + 1];
-    SSL* ssl;
-} delete_context_t;
-
 static int read_null_terminated(SSL* ssl, char* buf, size_t max_len) {
     size_t i = 0;
     while (i < max_len) {
@@ -230,44 +202,31 @@ error_code_t handle_delete_replica(SSL* ssl, const server_config_t* config) {
     return result;
 }
 
-static void* do_replication_handler(void* arg) {
-    replication_context_t* ctx = (replication_context_t*)arg;
-    SSL* ssl = SSL_new(ctx->ssl_ctx);
-
-    struct timeval timeout = {ctx->config->timeout_sec, 0};
-    if (setsockopt(ctx->sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
-        setsockopt(ctx->sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0 ||
-        !ssl || SSL_set_fd(ssl, ctx->sock) != 1 || SSL_accept(ssl) <= 0) {
-        fprintf(stderr, "Failed to establish TLS connection for replication\n");
+static void* do_replication_handler(SSL *ssl, const server_config_t *config ) {
+    uint8_t cmd_buf[8];
+    ssize_t n = SSL_read(ssl, cmd_buf, 6);
+    if (n != 6) {
+        fprintf(stderr, "Failed to read replication command\n");
     } else {
-        uint8_t cmd_buf[8];
-        ssize_t n = SSL_read(ssl, cmd_buf, 6);
-        if (n != 6) {
-            fprintf(stderr, "Failed to read replication command\n");
+        cmd_buf[n] = '\0';
+        error_code_t status = ERR_INTERNAL;
+            
+        if (strcmp((char*)cmd_buf, UPLOAD_CMD) == 0) {
+            status = handle_upload_replica(ssl, config);
+        } else if (strcmp((char*)cmd_buf, DELETE_CMD) == 0) {
+            status = handle_delete_replica(ssl, config);
         } else {
-            cmd_buf[n] = '\0';
-            error_code_t status = ERR_INTERNAL;
+            fprintf(stderr, "Unknown replication command: %s\n", cmd_buf);
+            status = ERR_BAD_REQUEST;
+        }
             
-            if (strcmp((char*)cmd_buf, UPLOAD_CMD) == 0) {
-                status = handle_upload_replica(ssl, ctx->config);
-            } else if (strcmp((char*)cmd_buf, DELETE_CMD) == 0) {
-                status = handle_delete_replica(ssl, ctx->config);
-            } else {
-                fprintf(stderr, "Unknown replication command: %s\n", cmd_buf);
-                status = ERR_BAD_REQUEST;
-            }
-            
-            if (status != ERR_OK) {
-                uint8_t err_byte = server_status_byte(status);
-                if (SSL_write(ssl, &err_byte, 1) != 1) {
-                    fprintf(stderr, "Failed to send error response\n");
-                }
+        if (status != ERR_OK) {
+            uint8_t err_byte = server_status_byte(status);
+            if (SSL_write(ssl, &err_byte, 1) != 1) {
+                fprintf(stderr, "Failed to send error response\n");
             }
         }
     }
-
-    SSL_free(ssl);
-    release_replication_context(ctx);
     return NULL;
 }
 
@@ -310,71 +269,18 @@ SSL_CTX* init_replication_ssl(const server_config_t* config) {
 }
 
 void* replication_handler(void* arg) {
-    int sock = *(int*)arg;
-    server_config_t* config = *(server_config_t**)((char*)arg + sizeof(int));
-    free(arg);
-
-    server_config_t* config_copy = malloc(sizeof(server_config_t));
-    if (!config_copy) {
-        close(sock);
-        return NULL;
+    client_context_t *ctx = arg;
+    SSL *ssl = SSL_new(ctx->ssl_ctx);
+    struct timeval timeout = {ctx->config->timeout_sec, 0};
+    if (setsockopt(ctx->sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
+        setsockopt(ctx->sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0 ||
+        !ssl || SSL_set_fd(ssl, ctx->sock) != 1 || SSL_accept(ssl) <= 0) {
+        fprintf(stderr, "Failed to establish TLS connection\n");
+    } else {
+        do_replication_handler(ssl, ctx->config);
     }
-
-    *config_copy = *config;
-    config_copy->cert_path = strdup(config_copy->cert_path);
-    config_copy->key_path = strdup(config_copy->key_path);
-    config_copy->data_dir = strdup(config_copy->data_dir);
-    config_copy->auth_db_path = strdup(config_copy->auth_db_path);
-    config_copy->coordinator_name = strdup(config_copy->coordinator_name);
-    config_copy->peer_cert_path = strdup(config_copy->peer_cert_path);
-
-    if (!config_copy->data_dir || !config_copy->auth_db_path) {
-        free(config_copy->data_dir);
-        free(config_copy->auth_db_path);
-        free(config_copy);
-        close(sock);
-        return NULL;
-    }
-
-    SSL_CTX* ssl_ctx = init_replication_ssl(config_copy);
-    if (!ssl_ctx) {
-        free(config_copy->data_dir);
-        free(config_copy->auth_db_path);
-        free(config_copy);
-        close(sock);
-        return NULL;
-    }
-
-    replication_context_t* ctx = malloc(sizeof(replication_context_t));
-    if (!ctx) {
-        SSL_CTX_free(ssl_ctx);
-        free((void*)config_copy->cert_path);
-        free((void*)config_copy->key_path);
-        free((void*)config_copy->data_dir);
-        free((void*)config_copy->auth_db_path);
-        free((void*)config_copy->coordinator_name);
-        free((void*)config_copy->peer_cert_path);
-        free(config_copy);
-        return NULL;
-    }
-
-    ctx->ssl_ctx = ssl_ctx;
-    ctx->sock = sock;
-    ctx->config = config_copy;
-
-    pthread_t thread;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-
-    if (pthread_create(&thread, &attr, do_replication_handler, ctx) != 0) {
-        SSL_CTX_free(ssl_ctx);
-        release_replication_context(ctx);
-        return NULL;
-    }
-
-    pthread_attr_destroy(&attr);
+    SSL_free(ssl);
+    release_client_context(ctx);
     return NULL;
 }
-
 

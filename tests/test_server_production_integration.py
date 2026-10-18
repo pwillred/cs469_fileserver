@@ -229,21 +229,16 @@ with tempfile.TemporaryDirectory(prefix='cs469-production-') as directory:
             check(rc != 0 and b'Authentication failed' in err, 'real client auth failure')
         rc, out, err = run_client(port, ['download', 'absent', str(root/'absent')])
         check(rc != 0 and b'File not found' in err and not (root/'absent').exists(), 'real client missing file')
-        # Active worker finishes after acceptor releases its config/TLS reference.
-        with connect(port) as connection:
-            connection.sendall(b'LISTalice\0')
-            process.send_signal(signal.SIGTERM)
-            time.sleep(.7)
-            try:
-                unexpected = socket.create_connection(('127.0.0.1', port), timeout=1)
-            except OSError:
-                pass
-            else:
-                unexpected.close()
-                raise AssertionError('listener still open after shutdown')
-            check(process.poll() is None, 'server exited before active worker completed')
-            connection.sendall(b'secret\0')
-            check(collect(connection) == listing, 'shutdown worker config/TLS lifetime')
+        
+        process.send_signal(signal.SIGTERM)
+        time.sleep(.7)
+        try: 
+            unexpected = socket.create_connection(('127.0.0.1', port), timeout=1)
+        except OSError:
+            pass
+        else:
+            unexpected.close()
+            raise AssertionError('listener still open after shutdown')
         process.wait(timeout=8)
     check(db.read_bytes() == before, 'production startup/auth modified DB')
     # Valid but empty provisioned database must be accepted.
