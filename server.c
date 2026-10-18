@@ -332,10 +332,14 @@ int main(int argc, const char** argv) {
     }
     
     SSL_CTX_free(ssl_ctx);
-    SSL_CTX_free(replication_ssl_ctx);
+
+    if (config->role == ROLE_REPLICA) {
+        SSL_CTX_free(replication_ssl_ctx);
+    	close(replication_socket);
+    }
+
     close(listen_socket);
-    close(replication_socket);
-    free(config);
+    //free(config); - intentional leak, used by child threads.  The OS will clean up.
     
     pthread_exit(0);
     return 0;

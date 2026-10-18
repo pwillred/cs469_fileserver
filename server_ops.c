@@ -45,6 +45,22 @@ void* handle_client(void* arg) {
     return NULL;
 }
 
+static error_code_t reject_replica_write(const server_read_io_t *io, int upload) {
+    char username[MAX_USERNAME_LEN + 1];
+    char password[MAX_PASSWORD_LEN + 1] = {0};
+    char filename[MAX_FILENAME_LEN + 1];
+    uint32_t size = 0;
+    int drained = server_read_field(io, username, sizeof(username)) != 0 &&
+                  server_read_field(io, password, sizeof(password)) != 0;
+    if (drained && upload)
+        drained = io->read_exact(io->state, &size, sizeof(size)) == 0;
+    if (drained)
+        drained = server_read_field(io, filename, sizeof(filename)) != 0;
+    OPENSSL_cleanse(password, sizeof(password));
+    (void)size;
+    return drained ? ERR_REPLICATION_FAILED : ERR_BAD_REQUEST;
+}
+
 server_read_result_t handle_request(SSL* ssl, const server_config_t* config) {
     server_protocol_io_t state;
     server_read_io_t io;
@@ -71,14 +87,14 @@ server_read_result_t handle_request(SSL* ssl, const server_config_t* config) {
     error_code_t status = ERR_BAD_REQUEST;
     if (selected == 1) {
         if (config->role == ROLE_REPLICA) {
-            status = ERR_REPLICATION_FAILED;
+            status = reject_replica_write(&io, 1);
         } else {
             status = handle_upload(ssl, config);
         }
     }
     if (selected == 3) {
         if (config->role == ROLE_REPLICA) {
-            status = ERR_REPLICATION_FAILED;
+            status = reject_replica_write(&io, 0);
         } else {
             status = handle_delete(ssl, config);
         }
@@ -114,7 +130,14 @@ error_code_t handle_upload(SSL* ssl, const server_config_t* config) {
     if (!user_dir) {
         return ERR_INTERNAL;
     }
-    
+
+    /* Two-phase UPLOAD: send preliminary OK before waiting for payload bytes.
+     * The dispatch layer sends the final status; this is response 1. */
+    if (send_error(ssl, ERR_OK) != 0) {
+        free(user_dir);
+        return ERR_INTERNAL;
+    }
+
     char temp_path[512];
     snprintf(temp_path, sizeof(temp_path), "%s/.temp_%s", user_dir, filename);
     
