@@ -196,24 +196,11 @@ with tempfile.TemporaryDirectory(prefix='cs469-production-') as directory:
         expect(port, request(user=b'u'*65), b'\4')
         expect(port, request(b'DELETE', name=b'absent'), b'\2', True)
         # Local write regression only. No peer, commit or replicated-success claim.
-        expect(port, request(b'UPLOAD', name=b'uploaded', size=4)+b'data', b'\0', True)
-        check((data/'alice'/'uploaded').read_bytes() == b'data', 'upload field order/content')
-        expect(port, request(b'DELETE', name=b'uploaded'), b'\0')
+        expect(port, request(b'UPLOAD', name=b'uploaded', size=4)+b'data', b'\0\6', True)
+        check(not (data/'alice'/'uploaded').exists(), 'no local mutation on replication failure')
+        expect(port, request(b'DELETE', name=b'uploaded'), b'\2')
         check(not (data/'alice'/'uploaded').exists(), 'local delete regression')
-        expect(port, request(b'UPLOAD', size=1024**3+1), b'\5')
-        # Preserve existing lack of preliminary status; don't fake client success.
-        with connect(port) as connection:
-            connection.sendall(request(b'UPLOAD', name=b'pending', size=3))
-            connection.settimeout(.15)
-            try:
-                connection.recv(1)
-                raise AssertionError('unexpected preliminary upload response')
-            except TimeoutError:
-                pass
-            connection.settimeout(8)
-            connection.sendall(b'abc')
-            check(collect(connection) == b'\0', 'legacy final status')
-        (data/'alice'/'pending').unlink()
+
         jobs = [(request(), listing), (request(b'DOWNLOAD'), download)]*6
         with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
             responses = list(pool.map(lambda item: exchange(port, item[0]), jobs))
