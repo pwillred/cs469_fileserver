@@ -407,6 +407,47 @@ post-status truncation and write guardrails. No external DNS outage or blackhole
 TCP route is required for deterministic timeout/resolver policy coverage.
 No partner server or external service is needed; temporary fixtures are removed.
 
+### Two-process distributed acceptance tests (work in progress)
+
+```sh
+make OPENSSL_PREFIX=/opt/homebrew/opt/openssl@3 test-two-node
+make OPENSSL_PREFIX=/opt/homebrew/opt/openssl@3 sanitize-two-node
+```
+
+`tests/test_two_node_integration.py` runs 23 acceptance scenarios against the
+actual server, client, and admin binaries. Its fixture creates temporary primary
+and replica data directories, independently provisioned credential DBs (admin
+password prompts use PTYs), dual-purpose TLS certificates with localhost/IP
+identities, a client trust bundle, and three dynamic loopback ports. It launches
+both roles with explicit peer configuration. Each scenario gets fresh node state;
+all processes and temporary material are cleaned up, including after failures.
+Python 3, POSIX PTYs, loopback access, and an OpenSSL CLI are required. `OPENSSL`
+can override the CLI path; otherwise Make uses `OPENSSL_PREFIX/bin/openssl` when
+a prefix is supplied, or `openssl` from PATH.
+
+This suite is deliberately **separate from `make test`**. At the integration
+baseline `9cf94e4`, replica request cleanup and replication-port connections can
+crash, UPLOAD lacks preliminary acceptance, and missing peer configuration allows
+local-only writes. These are real failures, not skips or expected-failure passes.
+Tests check process survival after responses, read failover, peer rejection,
+upload/delete outcomes, outage rejection, and repeated requests. A primary without
+peer configuration must reject startup or reject writes in normal replicated mode;
+the harness does not invent a standalone option. No distributed-pass claim is made.
+
+Failure reports include client outcomes and node stdout/stderr plus exit signals,
+with fixture passwords redacted. Startup waits for the flushed post-listen banner
+instead of opening a probe connection that could itself trigger replica cleanup.
+For a focused reproduction (after building), use a test-name substring:
+
+```sh
+python3 tests/test_two_node_integration.py ./server ./client ./admin --match test_03
+python3 tests/test_two_node_integration.py ./build/sanitize/server ./build/sanitize/client ./build/sanitize/admin --match test_10
+```
+
+Promote this suite into the normal aggregate only after the implementation meets
+the acceptance criteria. The existing green suites do not establish two-node
+correctness.
+
 `make sanitize` applies `-fsanitize=address,undefined -fno-omit-frame-pointer`
 and `-fno-sanitize-recover=all` to compilation and linking so detected errors fail
 the target. It runs all the same suites, including TLS/PTY
