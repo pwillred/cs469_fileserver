@@ -1,380 +1,228 @@
 # Fileserver Wire Protocol
 
-Scope: client ↔ server wire protocol for the CS469 fileserver project, plus the
-server-side behaviors it implies (replication, security, failover).
+This is the **working integration contract**, not a claim that all server paths
+pass acceptance. The merged client is the baseline for client-facing bytes and
+routing. Changes require coordination. See [README.md](README.md) for status,
+[INTEGRATION_ASSUMPTIONS.md](INTEGRATION_ASSUMPTIONS.md) for module interfaces, and
+[DEPLOYMENT.md](DEPLOYMENT.md) for local setup.
 
-## 1. Overview
+## 1. Scope and implementation status
 
-A small FTP-like file service. A user can:
+The supported topology is **one primary and one replica**. Client reads use local
+authentication/storage on either node; writes belong to primary. The replica has
+a separate mTLS endpoint for coordinated writes. Accounts are administered locally
+on each node, not replicated as files. Each client connection has its own thread.
 
-- `LIST` — list the files they have uploaded
-- `UPLOAD` — upload a file
-- `DOWNLOAD` — retrieve a file
-- `DELETE` — remove a file
+Implemented and tested: client codec/commands, TLS verification, read failover,
+credential storage, authentication and production reads. Role gates, peer mTLS and
+prepare/commit handlers exist but fail integration. Replica worker crashes,
+missing upload acceptance, implicit local-only writes and write-safety gaps are
+confirmed blockers. `make test-two-node` exposes these rather than masking them.
 
-Two server nodes run in a replicated pair.  One server is the primary that accepts read/write
-requests.  The other is a secondary replica that accepts read-only requests.  All traffic 
-(client ↔ server and server ↔ server) is TLS-encrypted.
+## 2. Common wire conventions
 
-## 2. System architecture (summary)
+- TCP is immediately upgraded to TLS; no plaintext fallback.
+- One operation per connection. UPLOAD has two status phases, not one response.
+- Command verbs are literal ASCII bytes without NUL, delimiter or padding.
+- Other strings are NUL-terminated printable ASCII. Credentials contain 1–64
+  characters plus NUL; filenames contain 1–256 characters plus NUL. Read at most
+  N+1 bytes for a maximum-N-character field; never truncate overlong input.
+- Server usernames additionally follow `[A-Za-z0-9_-]`. Filenames exclude `/`,
+  `\`, `.` and `..`. `.temp_` is internal staging space, hidden by read handlers;
+  write-side enforcement remains incomplete.
+- Multi-byte integers are unsigned 32-bit big-endian. The maximum representable
+  size is UINT32_MAX (4 GiB minus one byte). Current server UPLOAD policy is 1 GiB.
+- Status is exactly one byte; payload bytes have no delimiter or checksum field.
+  TLS provides transport integrity. Disk and concurrency correctness are separate.
 
-- Two server nodes, each a C/POSIX process, one handler thread per client
-  connection.
-- Files are stored in a per-user directory (`<root>/<username>/<filename>`).
-  A user can only ever see or touch their own files.
-- Usernames, salted password hashes, and salts live in a local SQLite database.
-  Accounts are created with a small administrative CLI tool, not over the
-  network protocol.
-- Node-to-node replication is authenticated with mutual TLS (client
-  certificates), not username/password.
-- Reads (`LIST`, `DOWNLOAD`) are served from local disk. Writes (`UPLOAD`,
-  `DELETE`) are applied locally, synchronously replicated to the peer, and only
-  acknowledged to the client once both nodes have committed. If the peer is
-  unreachable, writes are rejected; reads continue.
+## 3. Client-visible statuses
 
-## 3. Wire conventions
+| Byte | Status | Meaning |
+| --- | --- | --- |
+| 0 | OK | Success for this phase; upload preliminary OK is only acceptance |
+| 1 | AUTH_FAILED | Unknown account or incorrect password |
+| 2 | NOT_FOUND | Requested local file absent/unavailable under operation policy |
+| 3 | EXISTS | Existing remote name rejected; not treated as success by client |
+| 4 | BAD_REQUEST | Malformed/invalid request |
+| 5 | TOO_LARGE | Size exceeds the applicable limit |
+| 6 | REPLICATION_FAILED | Required replication failed; does not guarantee rollback after a commit decision |
+| 7 | INTERNAL | Internal server failure |
 
-- **Connection model:** exactly one operation per TCP connection. The client
-  connects, performs the operation, receives the complete response, and closes.
-  No framing is needed beyond the message formats below because there is at
-  most one request and one response per connection.
-- **Transport:** every connection is upgraded to TLS immediately. No plaintext
-  traffic is accepted. Credentials are never sent outside a TLS channel.
-- **Integers:** all multi-byte integers are big-endian (network byte order).
-- **Strings:** null-terminated ASCII. A field "no longer than N bytes" means at
-  most N characters plus one null terminator on the wire (N+1 bytes). A
-  receiver that reads N bytes and has not seen the null must abort the
-  connection with `BAD_REQUEST` (4) — never truncate.
-- **Filenames:** 1–256 characters, ASCII, and must not contain `/`. The names
-  `.` and `..` are rejected. This guarantees a name is always a single flat
-  entry inside the user's directory (no path traversal, no subdirectories).
-- **File sizes/lengths:** 32-bit unsigned integers, big-endian. This caps any
-  file at 4 GiB; larger files are out of scope.
-- **Timeouts:** the server applies an idle timeout to every read (header and
-  payload). A client that stalls mid-upload is disconnected and any partial
-   state is discarded. (Concrete value: open issue, §11.)
+Unknown status bytes are client protocol errors, not availability failures.
+All nonzero statuses produce client failure, including EXISTS and NOT_FOUND.
+Replica client-write rejection currently uses status 6. Status additions require
+coordination; the client does not silently accept extensions.
 
-## 4. Error codes
+## 4. Client operations (frozen layouts)
 
-Returned in the 1-byte status field of every response.
+### LIST
 
-| Code | Name                | Meaning                                                                           |
-|------|---------------------|-----------------------------------------------------------------------------------|
-| 0    | `OK`                | Success.                                                                          |
-| 1    | `AUTH_FAILED`       | Unknown username or wrong password                                                |
-| 2    | `NOT_FOUND`         | Named file does not exist in the user's directory.                                |
-| 3    | `EXISTS`            | File already exists (`UPLOAD` only). Client must `DELETE` first.                  |
-| 4    | `BAD_REQUEST`       | Malformed message: bad verb, over-long string, invalid filename, etc.             |
-| 5    | `TOO_LARGE`         | Declared size exceeds a server limit (e.g., disk quota/space).                    |
-| 6    | `REPLICATION_FAILED`| Secondary node unavailable or refused the write; the operation was not performed. |
-| 7    | `INTERNAL`          | Unexpected server error.                                                          |
-
-This set is a proposal and is subject to extension; new codes may be added
-in later revisions. Unrecognized codes must be treated as `INTERNAL` by clients.
-
-## 5. Operations
-
-### 5.1 LIST
-
-Request:
-
-```
-+--------+---------------------------+---------------------------+
-| "LIST" | username (<=64 + NUL)     | password (<=64 + NUL)     |
-+--------+---------------------------+---------------------------+
-   4 B               variable                  variable
+```text
+request:  "LIST" username\0 password\0
+response: status:u8
+          if OK: count:u32BE, then count filename\0 strings
 ```
 
-Response (all cases):
+The server returns sorted eligible regular-file names, excluding staging and
+symlinks. Missing user directory means an empty list. Maximum count is 10,000;
+server overflow returns INTERNAL. The client validates count and every name.
 
-```
-+----------+
-| status   |
-+----------+
-   1 B
-```
+### DOWNLOAD
 
-On `OK`, immediately followed by:
-
-```
-+----------------------+-----------------------------------------+
-| count (uint32 BE)    | count filenames, each <=256 chars + NUL |
-+----------------------+-----------------------------------------+
-     4 B                         variable
+```text
+request:  "DOWNLOAD" username\0 password\0 filename\0
+response: status:u8
+          if OK: size:u32BE, exactly size raw bytes
 ```
 
-- `count` is the number of files in the user's directory (a flat namespace —
-  there are no subdirectories). `count = 0` on an empty directory.
-- The client must read exactly `count` null-terminated strings.
+Zero bytes are valid. Missing files and excluded types/names return NOT_FOUND.
+After OK, an incomplete transfer closes/aborts the connection; no extra status
+can be appended to the payload. The client publishes only a complete local file
+and refuses to overwrite an existing local destination.
 
-### 5.2 UPLOAD
+### UPLOAD
 
-Request (header only):
-
-```
-+----------+-------------------+--------------------+-------------------+------------------------+
-| "UPLOAD" | username (<=64+NUL)| password (<=64+NUL)| size (uint32 BE)  | filename (<=256 + NUL) |
-+----------+-------------------+--------------------+-------------------+------------------------+
-    6 B              variable               variable          4 B               variable
-```
-
-`size` is the exact number of file-data bytes that follow, if accepted.
-
-Response 1 (after header):
-
-```
-+----------+
-| status   |
-+----------+
+```text
+header:      "UPLOAD" username\0 password\0 size:u32BE filename\0
+response 1:  preliminary status:u8
+             if nonzero: client stops without sending payload
+             if OK: client sends exactly size raw bytes
+response 2:  final status:u8
 ```
 
-- The server validates, in order: request format; authentication; filename
-  rules; `size` against server limits; peer liveness (it is a write); and that
-  no file with that name already exists.
-- `EXISTS` (3) if the name is taken. `REPLICATION_FAILED` (6) if the peer is
-  unavailable. The client sends **no file data** unless status is `OK`.
-- On `OK`, the client streams exactly `size` bytes of raw file data, then
-  reads:
+**Required final behavior:** validate role, credentials, header/name/size and
+required peer readiness before acceptance. Final OK follows successful coordinated
+completion on both nodes. Zero-byte uploads still require both statuses. No
+additional byte or changed field order is introduced by this document.
 
-Response 2 (after file data):
+**Current deviation:** `handle_upload` opens staging and waits for payload without
+sending preliminary OK; dispatch sends only one status. Thus the actual client
+cannot complete the success flow. Peer connection occurs after receiving payload.
+If `--peer-cert` is absent, the handler commits locally. A zero-byte local upload
+can mutate storage while the client fails waiting for the second status.
 
-```
-+----------+
-| status   |
-+----------+
-```
+The earlier proposal's no-overwrite/EXISTS policy is not consistently enforced:
+primary may replace an existing destination, replica checks for a regular file
+before staging, and neither has same-name serialization. Confirm and implement
+one coordinated overwrite policy; this documentation pass does not change it.
 
-- `OK` only after the file is durably stored on **both** nodes (see §7).
-- Any failure during the transfer (timeout, disk error, replication failure)
-  returns a non-zero status and the server discards its partial state.
+### DELETE
 
-### 5.3 DOWNLOAD
-
-Request:
-
-```
-+------------+--------------------+---------------------+------------------------+
-| "DOWNLOAD" | username (<=64+NUL)| password (<=64+NUL)  | filename (<=256 + NUL) |
-+------------+--------------------+---------------------+------------------------+
-    8 B              variable              variable             variable
+```text
+request:  "DELETE" username\0 password\0 filename\0
+response: one final status:u8
 ```
 
-Response:
+**Required final behavior:** authenticate, validate role/name/local existence,
+prepare the replica without deleting, decide commit, apply deletion and await
+replica completion before client OK. Failed prepare must preserve the local file.
 
-```
-+----------+
-| status   |
-+----------+
-   1 B
-```
+**Current state:** this ordering exists in the coordinator code but is blocked by
+replication endpoint/cleanup failures. Omitting `--peer-cert` takes a local-only
+path. A missing replica file is currently forwarded as NOT_FOUND; the intended
+divergence response is REPLICATION_FAILED, preserving the primary copy.
 
-On `OK`, immediately followed by:
+## 5. Peer protocol and transaction states
 
-```
-+----------------------+-----------------------------+
-| length (uint32 BE)   | length bytes of file data    |
-+----------------------+-----------------------------+
-     4 B                      variable
-```
+These are the current code's protocol shape and intended execution, **not a verified
+working distributed transaction**. One outbound channel targets the configured
+replica per write. Authentication is by mTLS, so no password is in the peer header.
 
-- `length` equals the on-disk file size. The client reads exactly `length`
-  bytes. A file of size 0 yields `length = 0` and no data bytes.
-- `NOT_FOUND` (2) if the file does not exist.
-
-### 5.4 DELETE
-
-Request:
-
-```
-+----------+--------------------+--------------------+------------------------+
-| "DELETE" | username (<=64+NUL)| password (<=64+NUL)| filename (<=256 + NUL) |
-+----------+--------------------+--------------------+------------------------+
-    6 B              variable             variable             variable
+```text
+UPLOAD prepare: "UPLOAD" username\0 size:u32BE filename\0, exactly size bytes
+DELETE prepare: "DELETE" username\0 filename\0
+prepare reply:  0 = prepared/ready; nonzero = failure
+primary decision: 0 = COMMIT; 1 = ABORT
+commit confirmation: 0 = success; nonzero = failure
 ```
 
-Response:
+| Phase | Coordinator | Replica |
+| --- | --- | --- |
+| Prepare UPLOAD | Stage locally, send header and body | Validate and stage without publishing; send ready |
+| Prepare DELETE | Check local file; send header | Check existence without deleting; send ready |
+| Commit | After ready, rename/unlink locally; send COMMIT; await confirmation | Apply rename/unlink, then confirm |
+| Abort | On local commit failure, attempt ABORT | Discard upload staging or preserve delete target |
+| Completion | Return OK only after required confirmation | Close channel |
 
-```
-+----------+
-| status   |
-+----------+
-   1 B
-```
+Actual prepare errors use client status values where implemented. Replica commit
+handlers currently emit 0/1 confirmation bytes; these are success/failure flags,
+not a new client-visible authentication result. Replica abort branches currently
+send 0 before closing; the coordinator does not wait for an abort confirmation.
+Some error paths also append a dispatcher error, so peer response ownership needs
+repair. There is **no commit retry** or multi-replica coordination in current code.
 
-- The server authenticates, checks the file exists (`NOT_FOUND` otherwise),
-  confirms peer liveness (it is a write — `REPLICATION_FAILED` if unavailable),
-  then deletes locally, replicates the deletion, and acknowledges only after
-  both nodes have committed.
+The replica attempts to discard upload staging on pre-decision disconnect/timeout;
+a prepared DELETE has not yet unlinked anything. Cleanup is not complete on every
+path. Raw replica reads assume some fields arrive in one SSL_read and reject valid
+maximum-length strings; these are implementation defects, not new field limits.
 
-## 6. Server-side processing notes
+## 6. Failure, concurrency and durability limits
 
-- **Atomicity:** uploads are written to a temporary file in the user's
-  directory and `rename()`d into place only after local commit (and, for the
-  client ack, after peer commit). A crash mid-write can therefore never leave
-  a partial file under its final name. On any failure path the temp file is
-  unlinked.
-- **Concurrent same-name uploads:** In shared memory, the primary fileserver
-  maintains a set of uploads in progress.  An upload with a duplicate name is 
-  immediately rejected.  .
-- **Reads during peer outage:** `LIST` and `DOWNLOAD` are served from local
-  disk with no peer involvement by both the primary and replica, so the service 
-  degrades to read-only rather than going down.
-- **No in-band checksum:** file-data integrity is provided by TLS; the
-  protocol does not add a checksum field.
+Required pre-commit rejection must not silently become local-only success. Current
+peer omission violates that requirement. With configured peer, failure paths
+attempt to return status 6, but unsafe cleanup can terminate connections/processes.
 
-## 7. Replication and consistency
+The coordinator commits locally before sending COMMIT/receiving confirmation. A
+peer failure or lost acknowledgement in that window can leave one node changed
+and the other unchanged. Status 6 or connection loss therefore does **not** imply
+“no state changed.” The client never automatically retries, fails over writes, or
+treats EXISTS/NOT_FOUND as successful retries. Manual inspection/reconciliation
+may be needed; no recovery log or automated reconciliation exists.
 
-- Model: synchronous replication on every write. The primary node that receives 
-  client request prepares the operation locally, sends the same operation to
-  its replicas over a dedicated TLS (mTLS) replication channel, and acknowledges
-  the client only after the replicas confirms they committed as well.
-- `DELETE` is a write and uses the same coordinate-then-ack flow as `UPLOAD`.
-- If the replica is unreachable or refuses, the write is rejected with
-  `REPLICATION_FAILED` and no state is changed on the receiving node.
-- Crash window: the primary can have fully prepared replicas, commit locally and 
-  have a replica crash before it commits the transaction.  The client will then see 
-  a connection error and may retry the write. On retry an upload of an already-applied name returns 
-  `EXISTS`, which the client treats as success (the file is present), and a delete of an
-  already-applied name returns `NOT_FOUND`, also treated as success.
-- The node-to-node message format and the prepare/commit exchange are. Every client-visible operation is
-  specified in §8.
+Same-user/filename serialization is not implemented. Primary staging remains a
+fixed `.temp_` path; replica has randomized exclusive staging, but path containment,
+short-write handling and cleanup gaps remain. Rename publication alone does not
+prove correctness under these races. Primary fwrite/fclose results are unchecked.
+Neither write implementation fsyncs file/directory state, so “durable on both nodes”
+is not an established guarantee. Required crash-durability/recovery scope remains
+a team decision; this project does not claim perfect atomicity in every crash window.
 
-## 8. Write coordination between nodes (UPLOAD and DELETE)
+## 7. TLS, authentication and timeouts
 
-Primary/secondary replication reuses the client wire protocol (§3 conventions:
-big-endian, null-terminated strings), omitting the password field — channel
-authentication is the mTLS client certificate, so no in-band credential is
-needed. Each write opens one replication channel per peer, one per operation,
-and the channel closes when the operation completes.
+The client verifies CA/certificate trust plus DNS/IP identity and requires TLS 1.2
+or newer. Client requests carry credentials inside TLS. Replica client writes are
+rejected at the role gate before credential parsing. Both nodes otherwise verify
+credentials against local read-only DB handles; accounts require manual provisioning.
 
-All writes use a two-phase prepare/commit exchange. The flow is identical for a 
-2-node or 3-node cluster — with more nodes the primary simply requires a successful 
-prepare from *all* peers before it commits, and every replica waits on the primary's byte
-before applying the write.
+Replication uses separate TLS contexts/listener, reusing each node's `-c/-k`.
+Replica requires a peer certificate; both directions load trust from `--peer-cert`.
+Outbound peer hostname/IP verification and SNI are absent. Exact peer-certificate
+trust and broader CA trust have different identity implications; do not claim the
+latter restricts access to a designated host. Worker crashes currently prevent
+successful end-to-end mTLS acceptance validation.
 
-### 8.1 UPLOAD
+Credential storage is implemented PBKDF2-HMAC-SHA256: default 600,000 iterations,
+16-byte random salts, 32-byte derived keys and stored KDF parameters. Verification
+uses stored validated parameters and constant-time derived-key comparison; unknown
+account/KDF timing is not equalized. Plaintext passwords are not stored.
 
-1. The primary receives the file from the client and writes it to a local
-   temp file (§6).
-2. For each replica, the primary opens a replication channel and sends the
-   header (§5.2 layout, minus the password field), followed by exactly
-   `size` bytes of file data:
+Current timeout behavior is not one universal idle deadline:
 
-   ```
-   +----------+--------------------+-------------------+------------------------+
-   | "UPLOAD" | username (<=64+NUL)| size (uint32 BE)  | filename (<=256 + NUL) |
-   +----------+--------------------+-------------------+------------------------+
-    6 B               variable           4 B               variable
-   ```
+- Client: default five-second connect/TLS deadline after synchronous resolution,
+  and deadlines per I/O call. DNS resolution is not deadline-bounded.
+- Server: `--timeout` defaults to 15 seconds. Read handlers use a configured network
+  operation deadline; DB/disk work is outside it. Write helpers reset per-call
+  deadlines, with several peer helpers using the default 15 seconds.
+- Replica raw TLS uses configured socket timeouts. Outbound peer connect/handshake
+  has no configured application deadline. This remains an implementation gap.
 
-3. Each replica validates the header (format, filename rules, size
-   limit, name not already present), writes the data to its own temp file, and
-   replies with one byte:
-   - `0` = prepared. The host then waits for the commit byte (step 4).
-   - non-zero = failure, using the §4 codes (e.g. `EXISTS`, `TOO_LARGE`,
-     `INTERNAL`). The replica unlinks its temp file and closes the channel.
-4. A prepared replica waits for one byte from the coordinator (idle
-   timeout applies; a timeout is treated as abort, which covers a crashed
-   coordinator):
-   - `0` = commit → rename its temp file to the indicated filename, send one
-     confirmation byte back to the coordinator (`0` = success, non-zero =
-     failure), and terminate.
-   - `1` = abort → unlink its temp file and terminate.
-5. The primary waits for the prepare byte from every peer:
-   - All prepared: the primary renames its own temp file to the final
-     filename, sends commit (`0`) to every replica, waits for every replica's
-     confirmation byte, then returns `OK` to the client. A replica that fails to
-     confirm gets one commit retry; if it still fails, the primary returns
-     `REPLICATION_FAILED` (6) to the client even though the other replicas
-     committed — a client retry against the other node converges (§7).
-   - Any replica failed to prepare: the coordinator unlinks its own temp
-     file, sends abort (`1`) to every peer that prepared, and returns
-     `REPLICATION_FAILED` (6) to the client.
+## 8. Read failover (merged client behavior)
 
-Net effect: a file appears under its final name on a replica host only
-after the primary has decided to commit. .
+LIST/DOWNLOAD try primary first, then replica at most once for RESOLVE_ERROR,
+CONNECT_ERROR, TIMEOUT, IO_ERROR or EOF during connect, request transmission or
+initial status read. Both attempts verify TLS and reuse the same transient password.
 
-### 8.2 DELETE
+Receipt of **any valid application status, including OK**, ends eligibility.
+Count/length/payload failures after OK are final. Certificate/identity failures,
+invalid CA/config, TLS negotiation errors, malformed/unknown statuses and local
+errors do not trigger failover. A replica failure is final; there is no return to
+primary, general retry loop or backoff. UPLOAD/DELETE never retry or fail over.
 
-1. The primary validates the request as in §5.4 (authentication, filename
-   rules, local file existence, peer liveness).
-2. For each replica, the primary sends over a replication channel (the §5.4
-   layout, minus the password field):
+## 9. Remaining coordination decisions
 
-   ```
-   +----------+--------------------+------------------------+
-   | "DELETE" | username (<=64+NUL)| filename (<=256 + NUL) |
-   +----------+--------------------+------------------------+
-    6 B               variable              variable
-   ```
+- Resolve remote overwrite policy consistently on both nodes.
+- Specify peer identity/trust policy for deployment beyond exact test certificates.
+- Define recovery/durability expectations after an ambiguous commit.
 
-3. Each replica checks that the file exists in its copy of the user's
-   directory and replies with one byte:
-   - `0` = ready. The host then waits for the commit byte (step 4).
-   - `2` = `NOT_FOUND` — the file is absent on this node. That indicates state
-     divergence; it is treated as a failure and logged by the primary
-     (§8.3). Other §4 codes may be returned for validation problems. The host
-     closes the channel and deletes nothing.
-4. A ready replica waits for one byte from the primary (idle
-   timeout applies; timeout = abort):
-   - `0` = commit → delete the file, send one confirmation byte to the
-     primary (`0` = success, non-zero = failure), and terminate.
-   - `1` = abort → leave the file in place and terminate.
-5. The primary waits for readiness from every replica:
-   - All ready: the primary deletes its own copy, sends commit (`0`)
-     to all replicas, waits for all confirmations, and returns `OK` to the
-     client (same retry / `REPLICATION_FAILED` fallback as §8.1).
-   - Any replica not ready: the primary leaves its own file in place,
-     sends abort (`1`) to the ready replicas, and returns `REPLICATION_FAILED`
-     (6) to the client.
-
-### 8.3 Coordinator crash mid-commit
-
-The prepare→commit window is the same crash window described in §7: a
-coordinator that dies after deciding to commit but before its commit byte
-reaches a peer leaves that peer's wait to time out, so the peer aborts while
-the surviving node(s) commit. Since the decision was commit, the correct
-converged state is the post-write state; the restart/resync procedure (open
-issue, §11) must reconcile the nodes toward it.
-
-Note: the post-commit confirmation byte (steps 4/5 above) is an addition to
-the initial sketch — it lets the coordinator verify each peer's final
-rename/delete actually succeeded before it acknowledges the client. The
-prepare→commit structure itself is as sketched.
-
-## 9. Security
-
-- **Transport:** TLS on every connection (client ↔ server, node ↔ node).
-- **Authentication:** every request carries username + password; the server
-  verifies the password against the stored salted hash and rejects with
-  `AUTH_FAILED` on any mismatch. Hashes are compared in constant time.
-- **Credential storage:** SQLite stores usernames, salts, and salted hashes
-  only — never plaintext passwords. Proposed KDF: PBKDF2-HMAC-SHA256 via
-  OpenSSL, iteration count an open issue (§11). Accounts are provisioned
-  offline by the admin CLI.
-- **Data isolation:** per-user directories mean authentication doubles as
-  access control — a session can only ever list, download, or delete files
-  in its own directory. No cross-user visibility by construction.
-- **Path traversal:** prevented by the filename rules in §3 (no `/`, no `.`/
-  `..`), enforced server-side before any filesystem operation.
-
-## 10. Client failover behavior
-
-- The client is configured with both server addresses (a preferred "primary"
-  and a peer). The user interacts with one logical file service.
-- On a connection-level failure (cannot connect, TLS handshake failure,
-  or a dropped mid-operation connection), the client transparently retries the
-  same operation against the other node, at most once, then reports failure.
-- On `REPLICATION_FAILED` (6) the client immediately reports the error and will
-  not retry the request. 
-- Operation-level errors (`AUTH_FAILED`, `NOT_FOUND`, `EXISTS`, `TOO_LARGE`,
-  …) are not retried against the peer; they are returned to the user.
-
-## 11. Open issues
-
-- Exact idle-timeout value for header and upload-payload reads.  
-- PBKDF2 iteration count / any per-user disk quota (basis for `TOO_LARGE`).
-- Replication: restart/resync procedure to reconcile nodes after a
-  coordinator crash mid-commit (§8.3), and the idle-timeout value for a
-  replicating host waiting on the commit byte.
-- Whether to allow uploading an empty file (`size = 0`). Current draft: yes.
+The client-facing layouts and routing above remain fixed while these decisions
+and the documented implementation defects are addressed.
