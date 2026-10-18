@@ -7,6 +7,7 @@ LDFLAGS ?=
 LDLIBS ?=
 PYTHON ?= python3
 OPENSSL_PREFIX ?=
+OPENSSL ?= $(if $(strip $(OPENSSL_PREFIX)),$(OPENSSL_PREFIX)/bin/openssl,openssl)
 SSL_LIBS ?= -lssl -lcrypto
 CRYPTO_LIBS ?= -lcrypto
 SQLITE_LIBS ?= -lsqlite3
@@ -46,7 +47,7 @@ TEST_TARGETS := test-password-db test-client-config test-client-password \
  test-client-failover test-server-auth test-server-auth-faults test-server-read \
  test-server-production
 
-.PHONY: all clean test check sanitize help $(TEST_TARGETS) test-client-integration
+.PHONY: all clean test check sanitize help $(TEST_TARGETS) test-client-integration test-two-node sanitize-two-node
 all: $(SERVER) $(CLIENT) $(ADMIN)
 
 # Production reads/authentication use the same modules as the isolated suites.
@@ -144,6 +145,13 @@ check: test
 sanitize:
 	$(MAKE) SANITIZE=1 test
 
+# Opt-in acceptance suite: known replication defects remain real failures.
+# Keep out of TEST_TARGETS until the distributed acceptance criteria pass.
+test-two-node: $(SERVER) $(CLIENT) $(ADMIN)
+	OPENSSL="$(OPENSSL)" $(PYTHON) tests/test_two_node_integration.py ./$(SERVER) ./$(CLIENT) ./$(ADMIN)
+sanitize-two-node:
+	$(MAKE) SANITIZE=1 test-two-node
+
 # Only generated paths, including objects from the original root-object build.
 # build/ is reserved for build products; do not store runtime data there.
 clean:
@@ -156,6 +164,8 @@ help:
 	@echo 'make test-client-commands     Run command API and executable integration tests'
 	@echo 'make test-server-auth-faults  Run injected authentication failure mappings'
 	@echo 'make sanitize                 Run all suites in build/sanitize using ASan/UBSan'
+	@echo 'make test-two-node            Run opt-in two-process acceptance tests (currently failing)'
+	@echo 'make sanitize-two-node        Run two-process acceptance tests using ASan/UBSan'
 	@echo 'make clean                    Remove generated binaries, objects and build/'
 	@echo 'Optional: OPENSSL_PREFIX=... CC=... CFLAGS=... CPPFLAGS=... LDFLAGS=... PYTHON=python3'
 
