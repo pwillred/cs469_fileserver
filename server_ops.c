@@ -313,10 +313,6 @@ error_code_t handle_delete(SSL* ssl, const server_config_t* config) {
     if (rep_status != ERR_OK) {
         SSL_free(replica_ssl);
         close(SSL_get_fd(replica_ssl));
-        if (replica_response == ERR_NOT_FOUND) {
-            free(user_dir);
-            return ERR_NOT_FOUND;
-        }
         free(user_dir);
         return ERR_REPLICATION_FAILED;
     }
