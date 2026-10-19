@@ -51,17 +51,17 @@ parameters remain validated per verification. Paths/parent directories must be
 administrator-controlled. The preflight handle is closed before accepting clients.
 
 Production read handlers and accepted primary writes authenticate through
-`server_auth`; replica client writes are rejected at the role gate before parsing
-credentials. The unused legacy verifier definition has been removed from server.c
+`server_auth`; replica client writes are rejected at the role gate without authentication,
+after bounded header parsing. The unused legacy verifier definition has been removed from server.c
 (the old declaration remains in password.h). Write credentials use bounded NUL
 parsing and full-capacity password erasure. No shared DB handle is introduced.
 
-Worker ownership is a required integration invariant: retained paths and TLS
-references must outlive the acceptor. Primary client workers preserve the existing
-read/auth lifetime behavior. Replica client workers currently free borrowed
-certificate/key pointers; replication worker argument alignment, ownership and
-socket lifetime are also broken. Do not infer safe replica shutdown from primary
-worker tests. The two-node sanitizer target reproduces these defects.
+Configuration has static process lifetime so detached workers can safely borrow
+it. Each heap connection context owns its socket and retained TLS-context reference;
+worker and pthread_create failure cleanup release them once. Peer connection
+cleanup saves the descriptor before freeing SSL, then closes it. Startup failures
+never free the static configuration object. Normal and sanitizer regressions cover
+startup failures and both worker types.
 
 ## Encoding
 
@@ -180,8 +180,8 @@ Legacy write I/O compatibility signatures now delegate to the SSL-first adapter,
 which is necessary because dispatch leaves sockets nonblocking. Write helper calls
 retain per-call deadlines; final write status uses the default 15-second timeout.
 Client-facing handshake socket waits use the configured timeout and SIGPIPE is
-ignored in production. That does not protect against the separate memory-lifetime
-crashes. Outbound replication connect/handshake lacks a configured deadline.
+ignored in production. Outbound replication connect/handshake lacks a configured
+application deadline.
 
 ## Routing and failover
 
@@ -201,7 +201,7 @@ never trigger failover. Download staging is removed on handled transfer failures
 UPLOAD/DELETE always use the primary and never retry or fail over, including after
 ambiguous connection loss. There are no general retry loops or backoff. A failed
 replica attempt is final; the client does not return to the primary. Server-side
-replica support is not established by these client/mock-server tests.
+replica support is additionally exercised by the production two-node suite.
 
 ## Ownership boundary
 
@@ -215,8 +215,8 @@ final documentation are shared responsibilities.
 
 The acceptor polls a nonblocking listener at most 500 ms between shutdown checks;
 SIGINT/SIGTERM only set a signal-safe flag. This avoids relying on listener
-shutdown to wake accept on macOS. Primary worker shutdown has regression coverage;
-replica worker lifetime is a current blocker.
+shutdown to wake accept on macOS. Listener shutdown and primary/replica worker survival have regression coverage;
+shutdown is not a durable transaction recovery mechanism.
 
 ## Current partner-owned write integration
 
@@ -240,40 +240,44 @@ Required client-facing completion contract is unchanged:
 - Neither write retries or fails over. EXISTS/NOT_FOUND remain errors, not retry
   success. An ambiguous failure cannot be assumed to mean no remote mutation.
 
-Current deviations and partial implementations:
+Implemented write behavior:
 
-- UPLOAD still waits for payload before sending its only status. This remains
-  incompatible with actual-client successful uploads.
-- With peer configuration, coordinator code sends prepare, applies local
-  rename/unlink after readiness, sends commit and awaits confirmation. Replica
-  handlers stage/check, reply ready and wait for commit/abort. Worker defects
-  prevent working integration; constants and code paths are not proof of success.
-- If primary `--peer-cert` is omitted, both handlers bypass replication and commit
-  locally. The acceptance target requires normal replicated mode to fail closed.
-  No explicit standalone mode exists.
-- There is one configured replica, no commit retry and no automatic reconciliation.
-  Post-local-commit failure may leave divergent state. A missing replica DELETE
-  file is currently forwarded as NOT_FOUND rather than the intended replication
-  failure. Shared protocol error/cleanup handling still needs repair.
-- Same-name coordination, safe write containment, checked local I/O, staging
-  collision prevention and complete cleanup remain partner-owned work. Read-side
-  `.temp_` filtering does not imply writes enforce that reserved namespace.
+- UPLOAD sends preliminary OK before receiving payload. After staging and checked
+  local close, primary prepares the replica, publishes locally, sends COMMIT and
+  awaits confirmation. Replica stages exclusively and handles short writes/EINTR.
+- DELETE prepares before local deletion; missing replica data fails with
+  REPLICATION_FAILED and preserves primary data. Missing local data is NOT_FOUND.
+- No peer configuration or an unavailable replica fails closed. Reads need no peer.
+- Conflicting `(username, filename)` writes serialize through completion/cleanup;
+  unrelated keys remain concurrent. Both nodes use short exclusive `.temp_XXXXXX`
+  names, mode 0600, hidden by reads. Write-side reserved-prefix enforcement and
+  broader no-follow containment are not implemented.
+- Replica field readers take buffer capacity including NUL, while protocol maxima
+  count content only. Username 64 and filename 256 parse without truncation;
+  one-byte-over values fail. Host NAME_MAX is checked separately before write-side
+  filesystem use. Unsupported upload components yield INTERNAL; DELETE yields
+  NOT_FOUND. Full paths that exceed buffers are rejected, never shortened.
+- Post-commit errors can leave an ambiguous distributed outcome. No retries,
+  persistent journal, crash recovery or fsync durability guarantee are provided.
+- Replica rejects an existing regular upload destination, but primary rename can
+  replace a primary-only destination in divergent state. Fixed-width peer reads
+  still assume complete TLS reads; some peer error paths append dispatcher errors.
 
-See [protocol.md](protocol.md) for peer message shapes and explicit distinctions
-between current code and required behavior. Remote overwrite policy, deployment
-peer identity and crash recovery/durability scope need team agreement; they do not
-justify changing the frozen client contract without coordination.
+See [protocol.md](protocol.md) for message shapes and [README.md](README.md) for
+consolidated limitations. Explicit peer certificate trust remains the deployment
+model; outbound peer hostname verification and SNI are absent.
 
 ## Validation boundaries
 
-`make test` covers unit/fault tests, TLS mocks and production primary/read
-integration; production-write tests still assert the known legacy one-status
-behavior. These tests can be green while distributed writes are broken.
+`make test` covers unit/fault tests, TLS mocks and production startup/read/write
+framing checks. `make test-two-node` covers 23 real-node scenarios, including
+replicated writes, outage/divergence, mTLS, failover and process survival.
+`make test-contract-boundaries` covers 13 field/filesystem/concurrency tests.
+`make test-server-write-correctness` covers seven groups of startup, conflicting
+writes, disconnect, partial-payload and local-I/O fault cases.
 
-`make test-two-node` and `make sanitize-two-node` are separate acceptance targets.
-They launch real nodes with temporary certs, local DBs, directories and actual
-client/admin PTY input. They assert process survival, read failover, peer rejection,
-write contracts, outage behavior and repeated requests. Current failures remain
-ordinary failures, not expected-failure passes. Use `--match` as documented in
-[README.md](README.md) to reproduce one scenario. Replica availability is not
-established by a correct response immediately followed by a process crash.
+`make acceptance` composes those four targets; `make acceptance-sanitize` runs the
+same targets with ASan/UBSan. Focused targets remain available. Fault injection
+is confined to dedicated test objects/binaries, never production builds. All these
+suites pass in both modes; arbitrary crash recovery and peer fragmentation are
+not proven by those results. See [README.md](README.md) for invocation examples.

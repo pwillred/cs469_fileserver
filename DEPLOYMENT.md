@@ -1,14 +1,13 @@
 # Local Two-Node Demo
 
-This is a **local development/reproduction guide**, not a working distributed
-release. At `7c96481`, primary reads work, but replica requests can return data
-then crash; replication-port connections can crash/reset; UPLOAD acceptance is
-missing. Run `make test-two-node` for automated isolated reproduction. Replicated
-write success below is an acceptance goal **after fixes**, not a current result.
+This walkthrough uses actual binaries and disposable local credentials/certificates.
+Run the shell blocks in order in one terminal, from the repository root. Use a
+fresh workspace for each run. Commands prompt interactively for passwords; enter
+the same demo password each time. No production credentials are needed.
 
 ## 1. Build and choose a temporary workspace
 
-Use one POSIX shell session from the repository root for the following steps.
+Use one Bash session (`bash`) from the repository root for the following steps.
 On macOS/Homebrew:
 
 ```sh
@@ -20,6 +19,7 @@ On a system with development libraries in standard locations, use `make` and
 `openssl_cli=openssl` instead. Python 3 is needed for dynamic port selection.
 
 ```sh
+set -e
 project_dir="$PWD"
 umask 077
 demo_dir=$(mktemp -d "${TMPDIR:-/tmp}/cs469-demo.XXXXXX")
@@ -43,8 +43,8 @@ trap cleanup_demo EXIT
 
 Manual-demo files remain until the cleanup step; they contain private keys and
 credential DBs. Do not commit them. The automated harness removes its fixtures
-itself, including on failure, and has bounded terminate/kill cleanup. Manual
-shutdown can wait on a stuck worker because current peer setup is not fully bounded.
+itself, including on failure, and has bounded terminate/kill cleanup. Outbound
+peer setup is not fully deadline-bounded; this demo uses local peers.
 
 ## 2. Provision independent accounts and directories
 
@@ -60,14 +60,6 @@ Enter the same password interactively on both nodes (1–64 printable ASCII
 characters for client use). No password appears in command arguments. Independent
 salts/hashes are expected; do not compare DB bytes. Repeat later password changes
 or account deletions on both nodes. Admin does not create user directories.
-
-Seed both disks manually for read/failover demonstrations. This is **not** evidence
-of replication:
-
-```sh
-printf 'CS469 read demo\n' > "$demo_dir/primary/data/alice/hello.txt"
-cp "$demo_dir/primary/data/alice/hello.txt" "$demo_dir/replica/data/alice/hello.txt"
-```
 
 ## 3. Generate temporary test identities and trust
 
@@ -107,8 +99,8 @@ Client trust includes both identities and checks the configured IP/DNS identity.
 Each server trusts only the other node's certificate for this demo. Replica mTLS
 requires a client certificate; primary presents its own identity. Current outbound
 replication code does not perform hostname/IP verification or SNI. Do not substitute
-a broad CA and assume it restricts access to the intended peer. The application
-still has lifecycle defects regardless of valid certificates.
+a broad CA and assume it restricts access to the intended peer. The two-node suite
+covers both trusted and untrusted peer connections.
 
 ## 4. Choose ports and define launch commands
 
@@ -151,25 +143,33 @@ start_primary() {
     > "$demo_dir/primary.log" 2>&1 &
   primary_pid=$!
 }
+wait_ready() {
+  python3 - "$1" "$2" <<'PY_READY'
+import os, sys, time
+from pathlib import Path
+pid, log = int(sys.argv[1]), Path(sys.argv[2])
+for _ in range(100):
+    os.kill(pid, 0)
+    if log.exists() and 'Server listening' in log.read_text(errors='replace'):
+        break
+    time.sleep(0.1)
+else:
+    raise SystemExit('Listener not ready: inspect ' + str(log))
+PY_READY
+}
 start_replica
+wait_ready "$replica_pid" "$demo_dir/replica.log"
 start_primary
+wait_ready "$primary_pid" "$demo_dir/primary.log"
 ```
 
-Inspect each log for `Server listening` before using the client:
+The readiness helper waits for the post-listen banner without creating an extra
+worker connection. On error, inspect `primary.log` and `replica.log` before
+continuing. `--coordinator-name` is the replica destination on primary. Both peers
+need explicit trust; missing primary peer configuration never permits local-only
+write success. There is no `--standalone` option.
 
-```sh
-cat "$demo_dir/replica.log" "$demo_dir/primary.log"
-kill -0 "$replica_pid"
-kill -0 "$primary_pid"
-```
-
-If banners are not yet present, inspect again; if a process exited, read its log
-before continuing. Avoid TCP port probes: accepting a connection can trigger the
-known replica defect. `--coordinator-name` is the **replica destination on primary**,
-not the primary's own advertised name. Do not omit `--peer-cert`: primary currently
-silently enables local-only writes in that case. There is no `--standalone` option.
-
-## 5. Configure the actual client and test primary reads
+## 5. Configure client, LIST, UPLOAD, LIST, DOWNLOAD
 
 ```sh
 cat > "$demo_dir/client.conf" <<EOF_CLIENT
@@ -180,68 +180,72 @@ replica_port=$replica_port
 ca_file=$demo_dir/trust.pem
 EOF_CLIENT
 ./client --config "$demo_dir/client.conf" --username alice list
+printf 'CS469 replicated upload demo\n' > "$demo_dir/upload.txt"
 ./client --config "$demo_dir/client.conf" --username alice \
-  download hello.txt "$demo_dir/from-primary.txt"
-cmp "$demo_dir/primary/data/alice/hello.txt" "$demo_dir/from-primary.txt"
+  upload "$demo_dir/upload.txt" uploaded.txt
+./client --config "$demo_dir/client.conf" --username alice list
+./client --config "$demo_dir/client.conf" --username alice \
+  download uploaded.txt "$demo_dir/from-primary.txt"
+cmp "$demo_dir/upload.txt" "$demo_dir/from-primary.txt"
+cmp "$demo_dir/upload.txt" "$demo_dir/primary/data/alice/uploaded.txt"
+cmp "$demo_dir/upload.txt" "$demo_dir/replica/data/alice/uploaded.txt"
 ```
 
-Each command prompts once. DOWNLOAD refuses an existing destination, so use a new
-local filename when repeating it. LIST should show `hello.txt` and DOWNLOAD should
-match the manually seeded bytes. Do not count a response as success for process
-lifetime: check that both server processes remain alive.
+The first LIST is empty; the second shows `uploaded.txt`. The replica copy comes
+from replication, not manual copying. DOWNLOAD refuses existing local destinations;
+use fresh local names if repeating a step. Each command prompts once.
 
-## 6. Exercise read failover and inspect replica lifetime
+## 6. Stop primary and demonstrate read failover
 
 ```sh
 kill "$primary_pid"
 wait "$primary_pid"
 primary_pid=
 ./client --config "$demo_dir/client.conf" --username alice list
+./client --config "$demo_dir/client.conf" --username alice \
+  download uploaded.txt "$demo_dir/from-replica.txt"
+cmp "$demo_dir/upload.txt" "$demo_dir/from-replica.txt"
 kill -0 "$replica_pid"
 ```
 
-The client should report `Primary server unavailable; trying replica...`. Current
-code may return the correct list and then crash the replica. A failed `kill -0`
-is a known failing integration outcome, not proof of working redundancy. Inspect
-`replica.log`; use `make sanitize-two-node` for the invalid-free diagnostic.
-
-For an independent DOWNLOAD failover reproduction, restart replica if it exited
-(`wait "$replica_pid"` to reap it, then `start_replica` and inspect the banner).
-Keep primary stopped and use:
+Both commands report `Primary server unavailable; trying replica...` and succeed.
+Failover is only eligible before a valid application status. Writes never retry
+or fail over. Restart primary before deleting:
 
 ```sh
-./client --config "$demo_dir/client.conf" --username alice \
-  download hello.txt "$demo_dir/from-replica.txt"
-kill -0 "$replica_pid"
-```
-
-The same cleanup crash may follow DOWNLOAD. Once fixed, both commands must leave
-replica alive. A connection error after a valid application status does not cause
-a second read attempt; writes never fail over.
-
-## 7. Replicated write demonstration — only after fixes
-
-First pass the two-node acceptance suite. Ensure both processes are running,
-restarting stopped/exited nodes with the functions above and checking banners.
-Use a fresh remote name. The following are **target acceptance steps**, not
-currently passing instructions:
-
-```sh
-printf 'Replicated upload demo\n' > "$demo_dir/upload.txt"
-./client --config "$demo_dir/client.conf" --username alice \
-  upload "$demo_dir/upload.txt" uploaded.txt
-cmp "$demo_dir/upload.txt" "$demo_dir/primary/data/alice/uploaded.txt"
-cmp "$demo_dir/upload.txt" "$demo_dir/replica/data/alice/uploaded.txt"
+start_primary
+wait_ready "$primary_pid" "$demo_dir/primary.log"
 ./client --config "$demo_dir/client.conf" --username alice delete uploaded.txt
 test ! -e "$demo_dir/primary/data/alice/uploaded.txt"
 test ! -e "$demo_dir/replica/data/alice/uploaded.txt"
+./client --config "$demo_dir/client.conf" --username alice list
 ```
 
-Current UPLOAD lacks preliminary OK and replication connections can crash/reset.
-Do not send payload early or alter the client to bypass this. After fixes, also
-stop replica and confirm primary reads work while writes return replication
-failure without unintended local changes. The harness automates these checks.
-An error after commit can leave an unknown outcome; do not automatically retry.
+## 7. Stop replica and demonstrate fail-closed writes
+
+```sh
+kill "$replica_pid"
+wait "$replica_pid"
+replica_pid=
+# Primary reads remain available; this LIST is empty.
+./client --config "$demo_dir/client.conf" --username alice list
+if ./client --config "$demo_dir/client.conf" --username alice \
+    upload "$demo_dir/upload.txt" outage.txt; then
+  echo 'Unexpected write success during replica outage' >&2
+  exit 1
+fi
+test ! -e "$demo_dir/primary/data/alice/outage.txt"
+test ! -e "$demo_dir/replica/data/alice/outage.txt"
+start_replica
+wait_ready "$replica_pid" "$demo_dir/replica.log"
+kill -0 "$primary_pid"
+kill -0 "$replica_pid"
+```
+
+The client exits nonzero with REPLICATION_FAILED (status 6). This outage occurs
+before commit and leaves no published file. More generally, an error after the
+commit decision may mean the client cannot confirm the final distributed outcome;
+never infer guaranteed rollback or automatically retry.
 
 ## 8. Stop and remove the disposable demo
 
@@ -250,9 +254,12 @@ cleanup_demo
 primary_pid=
 replica_pid=
 trap - EXIT
-# Remove only the fresh mktemp workspace created in step 1, after nodes stop.
+# Remove only the fresh mktemp workspace created above, after nodes stop.
 rm -rf -- "$demo_dir"
 ```
 
-If a current worker hangs during manual shutdown, terminate that recorded server
-PID before removing its files. Never reuse these demo certificates for deployment.
+The EXIT trap stops recorded server processes on early exit but retains files for
+diagnostics. On an interrupted run, stop those processes before deleting that
+workspace. Never reuse these disposable certificates for deployment. The automated
+acceptance harness provides bounded cleanup and independently exercises the same
+operations. No passwords, keys or database files belong in the repository.
