@@ -66,6 +66,7 @@ error_code_t read_and_verify_credentials(SSL* ssl, const server_config_t* config
 error_code_t read_filename(SSL *ssl, const server_config_t *config, char *filename);
 
 SSL* connect_to_replica(const server_config_t* config);
+void close_replica_connection(SSL *ssl);
 error_code_t send_upload_replication_header(SSL* ssl, const char* username, 
                                             uint32_t file_size, const char* filename);
 error_code_t send_delete_replication_header(SSL* ssl, const char* username, const char* filename);

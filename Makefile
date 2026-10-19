@@ -170,3 +170,18 @@ help:
 	@echo 'Optional: OPENSSL_PREFIX=... CC=... CFLAGS=... CPPFLAGS=... LDFLAGS=... PYTHON=python3'
 
 -include $(wildcard $(BUILD_DIR)/*.d $(TEST_DIR)/*.d)
+
+# Dedicated production-server fault injection; root binaries are untouched.
+$(TEST_DIR)/server_ops_write_faults.o: server_ops.c tests/server_write_faults.h Makefile
+	@mkdir -p "$(@D)"
+	$(CC) $(CPPFLAGS) $(PROJECT_CPPFLAGS) $(CFLAGS) $(SANITIZER_FLAGS) -MMD -MP \
+	  -include tests/server_write_faults.h -Dfwrite=fault_fwrite -Dferror=fault_ferror -Dfclose=fault_fclose -c $< -o $@
+$(TEST_DIR)/server_replication_write_faults.o: server_replication.c tests/server_write_faults.h Makefile
+	@mkdir -p "$(@D)"
+	$(CC) $(CPPFLAGS) $(PROJECT_CPPFLAGS) $(CFLAGS) $(SANITIZER_FLAGS) -MMD -MP \
+	  -include tests/server_write_faults.h -Dwrite=fault_write -c $< -o $@
+$(TEST_DIR)/server_write_faults: $(filter-out $(BUILD_DIR)/server_ops.o $(BUILD_DIR)/server_replication.o,$(SERVER_OBJS)) $(TEST_DIR)/server_ops_write_faults.o $(TEST_DIR)/server_replication_write_faults.o $(TEST_DIR)/server_write_faults.o
+	$(CC) $(CFLAGS) $(SANITIZER_FLAGS) $(LDFLAGS) $(OPENSSL_LDFLAGS) -o $@ $^ $(SSL_LIBS) $(SQLITE_LIBS) $(THREAD_LIBS) $(LDLIBS)
+.PHONY: test-server-write-correctness
+test-server-write-correctness: $(SERVER) $(CLIENT) $(ADMIN) $(TEST_DIR)/server_write_faults
+	OPENSSL="$(OPENSSL)" $(PYTHON) tests/test_server_write_correctness.py ./$(SERVER) ./$(CLIENT) ./$(ADMIN) ./$(TEST_DIR)/server_write_faults

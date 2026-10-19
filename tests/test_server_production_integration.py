@@ -53,7 +53,8 @@ with tempfile.TemporaryDirectory(prefix='cs469-production-') as directory:
     def startup_failure(arguments, text):
         global COUNT
         p = subprocess.run(arguments, capture_output=True, timeout=10)
-        check(p.returncode != 0 and text in p.stderr, f'expected startup failure: {p.stderr!r}')
+        check(p.returncode > 0 and text in p.stderr, f'expected clean startup failure: {p.returncode}: {p.stderr!r}')
+        check(b'Sanitizer' not in p.stderr and b'runtime error:' not in p.stderr, str(p.stderr))
         COUNT += 1
 
     startup_failure(args(free_port())[:-2], b'--auth-db')

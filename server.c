@@ -28,7 +28,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-/* Global config struct - we only need one, and having it be free()d is challenging - what if worker threads outlast main? */
+/* Process-lifetime configuration: strings borrow argv/static storage. Neither
+ * the object nor its members are freed; detached workers may outlive main. */
 static server_config_t config;
 
 static int positive_number(const char *text, int maximum) {
@@ -180,7 +181,6 @@ int main(int argc, const char** argv) {
     password_db_close(auth_db);
     if (db_result != PASSWORD_DB_OK) {
         fprintf(stderr, "Authentication DB preflight failed; provision an existing valid users DB via admin\n");
-        free(config);
         return 1;
     }
     
@@ -188,11 +188,10 @@ int main(int argc, const char** argv) {
     memset(&pipe_action, 0, sizeof(pipe_action));
     pipe_action.sa_handler = SIG_IGN;
     sigemptyset(&pipe_action.sa_mask);
-    if (sigaction(SIGPIPE, &pipe_action, NULL) < 0) { free(config); return 1; }
+    if (sigaction(SIGPIPE, &pipe_action, NULL) < 0) { return 1; }
 
     SSL_CTX* ssl_ctx = init_ssl(config);
     if (!ssl_ctx) {
-        free(config);
         return 1;
     }
     
@@ -202,7 +201,6 @@ int main(int argc, const char** argv) {
         replication_ssl_ctx = init_replication_ssl(config);
         if (!replication_ssl_ctx) {
             SSL_CTX_free(ssl_ctx);
-            free(config);
             return 1;
         }
         
@@ -210,14 +208,13 @@ int main(int argc, const char** argv) {
         if (replication_socket < 0) {
             SSL_CTX_free(ssl_ctx);
             SSL_CTX_free(replication_ssl_ctx);
-            free(config);
             return 1;
         }
         
         int flags = fcntl(replication_socket, F_GETFL);
         if (flags < 0 || fcntl(replication_socket, F_SETFL, flags | O_NONBLOCK) < 0) {
             SSL_CTX_free(ssl_ctx); SSL_CTX_free(replication_ssl_ctx);
-            close(listen_socket); close(replication_socket); free(config); return 1;
+            close(listen_socket); close(replication_socket); return 1;
         }
     }
     
@@ -225,13 +222,12 @@ int main(int argc, const char** argv) {
     if (listen_socket < 0) {
         SSL_CTX_free(ssl_ctx);
         SSL_CTX_free(replication_ssl_ctx);
-        free(config);
         return 1;
     }
     
     int flags = fcntl(listen_socket, F_GETFL);
     if (flags < 0 || fcntl(listen_socket, F_SETFL, flags | O_NONBLOCK) < 0) {
-        SSL_CTX_free(ssl_ctx); SSL_CTX_free(replication_ssl_ctx); close(listen_socket); close(replication_socket); free(config); return 1;
+        SSL_CTX_free(ssl_ctx); SSL_CTX_free(replication_ssl_ctx); close(listen_socket); close(replication_socket); return 1;
     }
 
     struct sigaction sa;
@@ -246,7 +242,6 @@ int main(int argc, const char** argv) {
         SSL_CTX_free(replication_ssl_ctx);
         close(listen_socket);
         close(replication_socket);
-        free(config);
         return 1;
     }
     
@@ -312,10 +307,12 @@ int main(int argc, const char** argv) {
 	        if (i == 0) {
 		    if (pthread_create(&thread, &attr, handle_client, ctx) != 0) {
                         fprintf(stderr, "Failed to create thread\n");
+                        release_client_context(ctx);
 		    }
 		} else {
 		    if (pthread_create(&thread, &attr, replication_handler, ctx) != 0) {
 		        fprintf(stderr, "Failed to create thread\n");
+                        release_client_context(ctx);
 		    }
 		}
                         
