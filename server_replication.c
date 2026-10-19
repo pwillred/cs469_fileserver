@@ -24,9 +24,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static int read_null_terminated(SSL* ssl, char* buf, size_t max_len) {
+/* capacity includes the framing NUL; protocol maxima count content only. */
+static int read_null_terminated(SSL* ssl, char* buf, size_t capacity) {
     size_t i = 0;
-    while (i < max_len) {
+    while (i < capacity) {
         ssize_t n = SSL_read(ssl, &buf[i], 1);
         if (n <= 0) return -1;
         if (buf[i] == '\0') return 0;
@@ -42,23 +43,15 @@ static int read_uint32_be(SSL* ssl, uint32_t* out) {
     return 0;
 }
 
-static char* make_temp_filename(const char* data_dir, const char* username, const char* filename) {
-    size_t len = strlen(data_dir) + 1 + strlen(username) + 1 + 14 + 8 + 1 + strlen(filename) + 1;
-    char* path = malloc(len);
-    if (!path) return NULL;
-    snprintf(path, len, "%s/%s/.temp_%08x_%s", data_dir, username, rand() & 0xFFFFFFFF, filename);
-    return path;
-}
-
 error_code_t handle_upload_replica(SSL* ssl, const server_config_t* config) {
     char username[MAX_USERNAME_LEN + 1] = {0};
     char filename[MAX_FILENAME_LEN + 1] = {0};
     uint32_t file_size = 0;
     char temp_path[512] = {0};
     
-    if (read_null_terminated(ssl, username, MAX_USERNAME_LEN) != 0) return ERR_BAD_REQUEST;
+    if (read_null_terminated(ssl, username, sizeof(username)) != 0) return ERR_BAD_REQUEST;
     if (read_uint32_be(ssl, &file_size) != 0) return ERR_BAD_REQUEST;
-    if (read_null_terminated(ssl, filename, MAX_FILENAME_LEN) != 0) return ERR_BAD_REQUEST;
+    if (read_null_terminated(ssl, filename, sizeof(filename)) != 0) return ERR_BAD_REQUEST;
     
     if (!validate_filename(filename)) return ERR_BAD_REQUEST;
     if (file_size > MAX_FILE_SIZE) return ERR_TOO_LARGE;
@@ -66,31 +59,39 @@ error_code_t handle_upload_replica(SSL* ssl, const server_config_t* config) {
     char* user_dir = get_user_dir(username, config->data_dir);
     if (!user_dir) return ERR_INTERNAL;
     
-    struct stat st;
-    if (stat(user_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
-        char file_path[512];
-        snprintf(file_path, sizeof(file_path), "%s/%s", user_dir, filename);
-        if (stat(file_path, &st) == 0 && S_ISREG(st.st_mode)) {
-            free(user_dir);
-            return ERR_EXISTS;
-        }
-    }
-    
-    char* temp_path_ptr = make_temp_filename(config->data_dir, username, filename);
-    if (!temp_path_ptr) {
+    if (filename_fits_directory(user_dir, filename) != 0) {
         free(user_dir);
         return ERR_INTERNAL;
     }
-    strncpy(temp_path, temp_path_ptr, sizeof(temp_path) - 1);
-    temp_path[sizeof(temp_path) - 1] = '\0';
-    free(temp_path_ptr);
-    
-    int fd = open(temp_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    char final_path[512];
+    int length = snprintf(final_path, sizeof(final_path), "%s/%s", user_dir, filename);
+    if (length < 0 || (size_t)length >= sizeof(final_path)) {
+        free(user_dir);
+        return ERR_INTERNAL;
+    }
+    struct stat st;
+    if (stat(final_path, &st) == 0 && S_ISREG(st.st_mode)) {
+        free(user_dir);
+        return ERR_EXISTS;
+    }
+    length = snprintf(temp_path, sizeof(temp_path), "%s/.temp_XXXXXX", user_dir);
+    if (length < 0 || (size_t)length >= sizeof(temp_path)) {
+        free(user_dir);
+        return ERR_INTERNAL;
+    }
+    /* Exclusive creation, mode 0600, independent of destination component length. */
+    int fd = mkstemp(temp_path);
     if (fd < 0) {
         free(user_dir);
         return ERR_INTERNAL;
     }
-    
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+        close(fd);
+        unlink(temp_path);
+        free(user_dir);
+        return ERR_INTERNAL;
+    }
+
     size_t remaining = file_size;
     uint8_t buffer[16384];
     while (remaining > 0) {
@@ -139,8 +140,6 @@ error_code_t handle_upload_replica(SSL* ssl, const server_config_t* config) {
     
     error_code_t result = ERR_OK;
     if (commit_byte == COMMIT) {
-        char final_path[512];
-        snprintf(final_path, sizeof(final_path), "%s/%s", user_dir, filename);
         if (rename(temp_path, final_path) < 0) {
             result = ERR_INTERNAL;
             unlink(temp_path);
@@ -161,16 +160,25 @@ error_code_t handle_delete_replica(SSL* ssl, const server_config_t* config) {
     char username[MAX_USERNAME_LEN + 1] = {0};
     char filename[MAX_FILENAME_LEN + 1] = {0};
     
-    if (read_null_terminated(ssl, username, MAX_USERNAME_LEN) != 0) return ERR_BAD_REQUEST;
-    if (read_null_terminated(ssl, filename, MAX_FILENAME_LEN) != 0) return ERR_BAD_REQUEST;
+    if (read_null_terminated(ssl, username, sizeof(username)) != 0) return ERR_BAD_REQUEST;
+    if (read_null_terminated(ssl, filename, sizeof(filename)) != 0) return ERR_BAD_REQUEST;
     
     if (!validate_filename(filename)) return ERR_BAD_REQUEST;
     
     char* user_dir = get_user_dir(username, config->data_dir);
     if (!user_dir) return ERR_INTERNAL;
     
+    /* An unrepresentable component cannot identify an existing file. */
+    if (filename_fits_directory(user_dir, filename) != 0) {
+        free(user_dir);
+        return ERR_NOT_FOUND;
+    }
     char file_path[512];
-    snprintf(file_path, sizeof(file_path), "%s/%s", user_dir, filename);
+    int length = snprintf(file_path, sizeof(file_path), "%s/%s", user_dir, filename);
+    if (length < 0 || (size_t)length >= sizeof(file_path)) {
+        free(user_dir);
+        return ERR_INTERNAL;
+    }
     
     struct stat st;
     if (stat(file_path, &st) < 0 || !S_ISREG(st.st_mode)) {

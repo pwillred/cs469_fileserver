@@ -64,6 +64,20 @@ int validate_filename(const char* filename) {
     return 1;
 }
 
+/* Wire validity is separate from the host's component limit. A -1 limit
+ * without errno means no determinate limit; the actual filesystem call remains
+ * authoritative. Never shorten the requested name. */
+int filename_fits_directory(const char *directory, const char *filename) {
+    errno = 0;
+    long limit = pathconf(directory, _PC_NAME_MAX);
+    if (limit < 0) return errno ? -1 : 0;
+    if (strlen(filename) > (size_t)limit) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
 /* get_user_dir takes the specified username and root directory of the service, and returns
  * the full path to the user's directory. */
 char* get_user_dir(const char* username, const char* data_dir) {
