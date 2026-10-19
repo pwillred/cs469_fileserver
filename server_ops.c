@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 
 void release_client_context(client_context_t *ctx) {
     SSL_CTX_free(ctx->ssl_ctx);
@@ -104,226 +105,183 @@ server_read_result_t handle_request(SSL* ssl, const server_config_t* config) {
     return (server_read_result_t){status, 1};
 }
 
+/* Only active primary writes occupy this registry. Entries and their keys live
+ * in the owning handler's stack until release. Waiters recheck after broadcasts;
+ * unrelated keys never wait for network/disk work under the registry mutex.
+ * Workers are not canceled by shutdown. Defer cancellation while registered so
+ * every exit first closes resources and removes its stack entry. */
+typedef struct write_guard {
+    const char *user;
+    const char *name;
+    struct write_guard *next;
+    int cancellation_state;
+} write_guard_t;
+static pthread_mutex_t write_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t write_changed = PTHREAD_COND_INITIALIZER;
+static write_guard_t *active_writes;
+
+static int acquire_write(write_guard_t *guard, const char *user, const char *name) {
+    if (pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &guard->cancellation_state) != 0)
+        return -1;
+    if (pthread_mutex_lock(&write_mutex) != 0) {
+        pthread_setcancelstate(guard->cancellation_state, NULL);
+        return -1;
+    }
+    for (;;) {
+        write_guard_t *entry = active_writes;
+        while (entry && (strcmp(entry->user, user) || strcmp(entry->name, name)))
+            entry = entry->next;
+        if (!entry) break;
+        if (pthread_cond_wait(&write_changed, &write_mutex) != 0) {
+            pthread_mutex_unlock(&write_mutex);
+            pthread_setcancelstate(guard->cancellation_state, NULL);
+            return -1;
+        }
+    }
+    guard->user = user;
+    guard->name = name;
+    guard->next = active_writes;
+    active_writes = guard;
+    pthread_mutex_unlock(&write_mutex);
+    return 0;
+}
+
+static void release_write(write_guard_t *guard) {
+    pthread_mutex_lock(&write_mutex);
+    write_guard_t **entry = &active_writes;
+    while (*entry != guard) entry = &(*entry)->next;
+    *entry = guard->next;
+    pthread_cond_broadcast(&write_changed);
+    pthread_mutex_unlock(&write_mutex);
+    pthread_setcancelstate(guard->cancellation_state, NULL);
+}
+
 error_code_t handle_upload(SSL* ssl, const server_config_t* config) {
     char username[MAX_USERNAME_LEN + 1];
     char filename[MAX_FILENAME_LEN + 1];
     uint32_t size;
-
     error_code_t err = read_and_verify_credentials(ssl, config, username);
-    if (err != ERR_OK) {
-        return err;
-    }
-
-    int ret = read_fully(ssl, &size, 4, config->timeout_sec);
-    if (ret < 0) {
-        return ERR_BAD_REQUEST;
-    }
+    if (err != ERR_OK) return err;
+    if (read_fully(ssl, &size, 4, config->timeout_sec) < 0) return ERR_BAD_REQUEST;
     size = ntohl(size);
     err = read_filename(ssl, config, filename);
     if (err != ERR_OK) return err;
-    
-    if (size > MAX_FILE_SIZE) {
-        return ERR_TOO_LARGE;
-    }
-    
-    char* user_dir = get_user_dir(username, config->data_dir);
-    if (!user_dir) {
-        return ERR_INTERNAL;
-    }
+    if (size > MAX_FILE_SIZE) return ERR_TOO_LARGE;
 
-    /* Two-phase UPLOAD: send preliminary OK before waiting for payload bytes.
-     * The dispatch layer sends the final status; this is response 1. */
-    if (send_error(ssl, ERR_OK) != 0) {
-        free(user_dir);
-        return ERR_INTERNAL;
-    }
+    write_guard_t guard;
+    if (acquire_write(&guard, username, filename) != 0) return ERR_INTERNAL;
+    char *user_dir = get_user_dir(username, config->data_dir);
+    char temp_path[512], final_path[512];
+    int staged = 0;
+    FILE *file = NULL;
+    SSL *peer = NULL;
+    err = ERR_INTERNAL;
+    if (!user_dir) goto done;
+    int length = snprintf(temp_path, sizeof(temp_path), "%s/.temp_XXXXXX", user_dir);
+    if (length < 0 || (size_t)length >= sizeof(temp_path)) goto done;
+    length = snprintf(final_path, sizeof(final_path), "%s/%s", user_dir, filename);
+    if (length < 0 || (size_t)length >= sizeof(final_path)) goto done;
 
-    char temp_path[512];
-    snprintf(temp_path, sizeof(temp_path), "%s/.temp_%s", user_dir, filename);
-    
-    FILE* f = fopen(temp_path, "wb");
-    if (!f) {
-        free(user_dir);
-        return ERR_INTERNAL;
-    }
-    
-    char* buf = malloc(8192);
-    if (!buf) {
-        fclose(f);
-        free(user_dir);
-        return ERR_INTERNAL;
-    }
-    
+    /* Response 1 precedes payload. Dispatch owns response 2. */
+    if (send_error(ssl, ERR_OK) != 0) goto done;
+    int fd = mkstemp(temp_path); /* exclusive, unique, mode 0600 */
+    if (fd < 0) goto done;
+    staged = 1;
+    file = fdopen(fd, "wb");
+    if (!file) { close(fd); goto done; }
+    unsigned char buffer[8192];
     size_t remaining = size;
-    while (remaining > 0) {
-        size_t to_read = remaining < 8192 ? remaining : 8192;
-        ret = read_fully(ssl, buf, to_read, config->timeout_sec);
-        if (ret < 0) {
-            free(buf);
-            fclose(f);
-            unlink(temp_path);
-            free(user_dir);
-            return ERR_BAD_REQUEST;
+    while (remaining) {
+        size_t count = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+        if (read_fully(ssl, buffer, count, config->timeout_sec) < 0) {
+            err = ERR_BAD_REQUEST;
+            goto done;
         }
-        fwrite(buf, 1, to_read, f);
-        remaining -= to_read;
-    }
-    
-    fclose(f);
-    free(buf);
-    
-    SSL* replica_ssl = connect_to_replica(config);
-    if (!replica_ssl) {
-        unlink(temp_path);
-        free(user_dir);
-        return ERR_REPLICATION_FAILED;
-    }
-    
-    error_code_t rep_status = send_upload_replication_header(replica_ssl, username, size, filename);
-    if (rep_status != ERR_OK) {
-        SSL_free(replica_ssl);
-        close(SSL_get_fd(replica_ssl));
-        unlink(temp_path);
-        free(user_dir);
-        return ERR_REPLICATION_FAILED;
-    }
-    
-    rep_status = send_file_data(replica_ssl, temp_path, size);
-    if (rep_status != ERR_OK) {
-        SSL_free(replica_ssl);
-        close(SSL_get_fd(replica_ssl));
-        unlink(temp_path);
-        free(user_dir);
-        return ERR_REPLICATION_FAILED;
-    }
-    
-    uint8_t replica_response;
-    rep_status = read_replica_response(replica_ssl, &replica_response);
-    if (rep_status != ERR_OK) {
-        if (rep_status == ERR_EXISTS || rep_status == ERR_TOO_LARGE || rep_status == ERR_BAD_REQUEST) {
-            SSL_free(replica_ssl);
-            close(SSL_get_fd(replica_ssl));
-            unlink(temp_path);
-            free(user_dir);
-            return rep_status;
+        size_t offset = 0;
+        while (offset < count) {
+            size_t written = fwrite(buffer + offset, 1, count - offset, file);
+            if (ferror(file) || written == 0) goto done;
+            offset += written;
         }
-        SSL_free(replica_ssl);
-        close(SSL_get_fd(replica_ssl));
-        unlink(temp_path);
-        free(user_dir);
-        return ERR_REPLICATION_FAILED;
+        remaining -= count;
     }
-    
-    char final_path[512];
-    snprintf(final_path, sizeof(final_path), "%s/%s", user_dir, filename);
-    
+    int closed = fclose(file);
+    file = NULL; /* fclose consumes the stream even on failure. */
+    if (closed != 0) goto done;
+
+    err = ERR_REPLICATION_FAILED;
+    peer = connect_to_replica(config);
+    if (!peer) goto done;
+    if (send_upload_replication_header(peer, username, size, filename) != ERR_OK ||
+        send_file_data(peer, temp_path, size) != ERR_OK) goto done;
+    uint8_t response;
+    error_code_t prepared = read_replica_response(peer, &response);
+    if (prepared != ERR_OK) {
+        if (prepared == ERR_EXISTS || prepared == ERR_TOO_LARGE || prepared == ERR_BAD_REQUEST)
+            err = prepared;
+        goto done;
+    }
     if (rename(temp_path, final_path) < 0) {
-        uint8_t abort_byte = ABORT;
-        send_commit_byte(replica_ssl, abort_byte);
-        SSL_free(replica_ssl);
-        close(SSL_get_fd(replica_ssl));
-        free(user_dir);
-        return ERR_INTERNAL;
+        (void)send_commit_byte(peer, ABORT);
+        err = ERR_INTERNAL;
+        goto done;
     }
-    
-    uint8_t commit_byte = COMMIT;
-    if (send_commit_byte(replica_ssl, commit_byte) != 0) {
-        free(user_dir);
-        return ERR_REPLICATION_FAILED;
-    }
-    
+    staged = 0;
+    if (send_commit_byte(peer, COMMIT) != 0) goto done;
     uint8_t confirm;
-    rep_status = read_confirmation(replica_ssl, &confirm);
-    SSL_free(replica_ssl);
-    close(SSL_get_fd(replica_ssl));
-    
-    if (rep_status != ERR_OK || confirm != 0) {
-        free(user_dir);
-        return ERR_REPLICATION_FAILED;
-    }
-    
+    if (read_confirmation(peer, &confirm) != ERR_OK || confirm != 0) goto done;
+    err = ERR_OK;
+done:
+    if (file) (void)fclose(file);
+    close_replica_connection(peer);
+    if (staged) (void)unlink(temp_path);
     free(user_dir);
-    return ERR_OK;
+    release_write(&guard);
+    return err;
 }
 
 error_code_t handle_delete(SSL* ssl, const server_config_t* config) {
     char username[MAX_USERNAME_LEN + 1];
     char filename[MAX_FILENAME_LEN + 1];
-    
     error_code_t err = read_and_verify_credentials(ssl, config, username);
-    if (err != ERR_OK) {
-        return err;
-    }
-
+    if (err != ERR_OK) return err;
     err = read_filename(ssl, config, filename);
-    if (err != ERR_OK) {
-    	return err;
-    }
-      
-    char* user_dir = get_user_dir(username, config->data_dir);
-    if (!user_dir) {
-        return ERR_INTERNAL;
-    }
-    
+    if (err != ERR_OK) return err;
+
+    write_guard_t guard;
+    if (acquire_write(&guard, username, filename) != 0) return ERR_INTERNAL;
+    char *user_dir = get_user_dir(username, config->data_dir);
+    SSL *peer = NULL;
     char file_path[512];
-    snprintf(file_path, sizeof(file_path), "%s/%s", user_dir, filename);
-    
+    err = ERR_INTERNAL;
+    if (!user_dir) goto done;
+    int length = snprintf(file_path, sizeof(file_path), "%s/%s", user_dir, filename);
+    if (length < 0 || (size_t)length >= sizeof(file_path)) goto done;
     struct stat st;
     if (stat(file_path, &st) < 0 || !S_ISREG(st.st_mode)) {
-        free(user_dir);
-        return ERR_NOT_FOUND;
+        err = ERR_NOT_FOUND;
+        goto done;
     }
-    
-    SSL* replica_ssl = connect_to_replica(config);
-    if (!replica_ssl) {
-        free(user_dir);
-        return ERR_REPLICATION_FAILED;
-    }
-    
-    error_code_t rep_status = send_delete_replication_header(replica_ssl, username, filename);
-    if (rep_status != ERR_OK) {
-        SSL_free(replica_ssl);
-        close(SSL_get_fd(replica_ssl));
-        free(user_dir);
-        return ERR_REPLICATION_FAILED;
-    }
-    
-    uint8_t replica_response;
-    rep_status = read_replica_response(replica_ssl, &replica_response);
-    if (rep_status != ERR_OK) {
-        SSL_free(replica_ssl);
-        close(SSL_get_fd(replica_ssl));
-        free(user_dir);
-        return ERR_REPLICATION_FAILED;
-    }
-    
+    err = ERR_REPLICATION_FAILED;
+    peer = connect_to_replica(config);
+    if (!peer || send_delete_replication_header(peer, username, filename) != ERR_OK)
+        goto done;
+    uint8_t response;
+    if (read_replica_response(peer, &response) != ERR_OK) goto done;
     if (unlink(file_path) < 0) {
-        uint8_t abort_byte = ABORT;
-        send_commit_byte(replica_ssl, abort_byte);
-        SSL_free(replica_ssl);
-        close(SSL_get_fd(replica_ssl));
-        free(user_dir);
-        return ERR_INTERNAL;
+        (void)send_commit_byte(peer, ABORT);
+        err = ERR_INTERNAL;
+        goto done;
     }
-    
-    uint8_t commit_byte = COMMIT;
-    if (send_commit_byte(replica_ssl, commit_byte) != 0) {
-        free(user_dir);
-        return ERR_REPLICATION_FAILED;
-    }
-    
+    if (send_commit_byte(peer, COMMIT) != 0) goto done;
     uint8_t confirm;
-    rep_status = read_confirmation(replica_ssl, &confirm);
-    SSL_free(replica_ssl);
-    close(SSL_get_fd(replica_ssl));
-    
-    if (rep_status != ERR_OK || confirm != 0) {
-        free(user_dir);
-        return ERR_REPLICATION_FAILED;
-    }
-    
+    if (read_confirmation(peer, &confirm) != ERR_OK || confirm != 0) goto done;
+    err = ERR_OK;
+done:
+    close_replica_connection(peer);
     free(user_dir);
-    return ERR_OK;
+    release_write(&guard);
+    return err;
 }
 
 error_code_t read_and_verify_credentials(SSL* ssl, const server_config_t* config, char *username) {

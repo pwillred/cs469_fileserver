@@ -102,14 +102,19 @@ error_code_t handle_upload_replica(SSL* ssl, const server_config_t* config) {
             free(user_dir);
             return ERR_BAD_REQUEST;
         }
-        ssize_t written = write(fd, buffer, n);
-        if (written < 0) {
-            close(fd);
-            unlink(temp_path);
-            free(user_dir);
-            return ERR_INTERNAL;
+        size_t offset = 0;
+        while (offset < (size_t)n) {
+            ssize_t written = write(fd, buffer + offset, (size_t)n - offset);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) {
+                close(fd);
+                unlink(temp_path);
+                free(user_dir);
+                return ERR_INTERNAL;
+            }
+            offset += (size_t)written;
         }
-        remaining -= (size_t)written;
+        remaining -= (size_t)n;
     }
     
     if (close(fd) < 0) {
@@ -138,6 +143,7 @@ error_code_t handle_upload_replica(SSL* ssl, const server_config_t* config) {
         snprintf(final_path, sizeof(final_path), "%s/%s", user_dir, filename);
         if (rename(temp_path, final_path) < 0) {
             result = ERR_INTERNAL;
+            unlink(temp_path);
         }
         uint8_t confirm = result == ERR_OK ? 0 : 1;
         if (SSL_write(ssl, &confirm, 1) != 1) result = ERR_REPLICATION_FAILED;

@@ -164,11 +164,20 @@ cleanup:
     return NULL;
 }
 
+/* SSL_set_fd installs a non-owning socket BIO. A successful connect transfers
+ * both SSL and fd to the caller; destroy SSL before closing the saved fd. */
+void close_replica_connection(SSL *ssl) {
+    if (!ssl) return;
+    int fd = SSL_get_fd(ssl);
+    SSL_free(ssl);
+    if (fd >= 0) close(fd);
+}
+
 /* send_upload_replication_header sends the upload replication header to a replica.
  * Returns ERR_OK on success, error code on failure. */
 error_code_t send_upload_replication_header(SSL* ssl, const char* username, 
                                             uint32_t file_size, const char* filename) {
-    uint8_t cmd[UPLOAD_CMD_LEN] = "UPLOAD";
+    const uint8_t cmd[] = "UPLOAD";
     uint32_t be_size = htonl(file_size);
     
     if (write_fully(ssl, cmd, UPLOAD_CMD_LEN) != 0) return ERR_BAD_REQUEST;
@@ -182,7 +191,7 @@ error_code_t send_upload_replication_header(SSL* ssl, const char* username,
 /* send_delete_replication_header sends the delete replication header to a replica.
  * Returns ERR_OK on success, error code on failure. */
 error_code_t send_delete_replication_header(SSL* ssl, const char* username, const char* filename) {
-    uint8_t cmd[DELETE_CMD_LEN] = "DELETE";
+    const uint8_t cmd[] = "DELETE";
     
     if (write_fully(ssl, cmd, DELETE_CMD_LEN) != 0) return ERR_BAD_REQUEST;
     if (write_fully(ssl, username, strlen(username) + 1) != 0) return ERR_BAD_REQUEST;
