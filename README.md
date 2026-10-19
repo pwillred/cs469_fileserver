@@ -1,32 +1,31 @@
 # Secure Replicated File Service
 
 CS469 Distributed Systems, Regis University — Fedil Grogan and Brian Leake.
-A CLI file service intended to run one primary and one read-only replica.
-**The distributed service is not yet submission-ready.**
+A command-line file service with one primary and one read-only replica.
 
-## Current Status
+## Project Status
 
-Status reflects source at `7c96481` (two-node acceptance harness included).
-“Working” describes the stated component, not successful replicated writes.
+Implemented within the course project's single-primary/single-replica scope.
+The normal and ASan/UBSan suites pass, including 23 two-node scenarios,
+13 boundary/concurrency tests and seven write-correctness groups in each mode.
 
 | Area | Status |
 | --- | --- |
-| SQLite password DB and admin CLI | COMPLETE / WORKING — local account administration |
-| Client configuration, prompting, codec and all four commands | COMPLETE / WORKING against the working client contract |
-| Client TLS | COMPLETE / WORKING — trust and DNS/IP identity verification |
-| Production authentication | COMPLETE / WORKING — local read-only DB, startup preflight |
-| Production LIST / DOWNLOAD | COMPLETE / WORKING on primary; replica responses are affected by worker cleanup crashes |
-| Client read failover | COMPLETE / WORKING routing; replica can return a response and then crash |
-| Build and normal test workflow | COMPLETE / WORKING; normal tests pass, existing server warnings remain |
-| Primary/replica roles | IMPLEMENTED / INTEGRATION IN PROGRESS — write gate exists, replica lifetime is broken |
-| Replication mTLS | IMPLEMENTED / INTEGRATION IN PROGRESS — mutual verification configured, endpoint fails |
-| UPLOAD replication | IMPLEMENTED / INTEGRATION IN PROGRESS — partial coordinator/participant flow; preliminary status missing |
-| DELETE replication | IMPLEMENTED / INTEGRATION IN PROGRESS — partial prepare/commit flow; peer endpoint fails |
-| Two-node acceptance suite | IMPLEMENTED — deliberately reports current integration failures |
+| Client and verified TLS | Complete |
+| SQLite credentials, admin CLI and authentication | Complete |
+| LIST / DOWNLOAD | Complete on both nodes |
+| Read failover | Complete |
+| Primary/replica roles | Complete |
+| Replicated UPLOAD / DELETE | Complete |
+| mTLS replication | Complete with explicit peer trust |
+| Same-file serialization | Complete |
+| Boundary handling | Complete; host filesystem limits still apply |
+| Automated acceptance | Passing |
+| Build | Zero compiler warnings in validated macOS build |
 
 ## Architecture
 
-Intended final behavior:
+Current topology:
 
 ```text
 Client
@@ -42,8 +41,8 @@ Client
 
 The user addresses one logical service. Topology comes from client configuration.
 LIST/DOWNLOAD use primary first and can fail over once to replica. Writes remain
-primary-only with no automatic retry. Intended write success requires both nodes
-and their commit acknowledgements; current implementation gaps are listed below.
+primary-only with no automatic retry. Write success requires replica participation
+and commit confirmation.
 Reads use local disk/DB without consulting the peer.
 
 ## Build and Test
@@ -68,8 +67,11 @@ current validation is on macOS, not a claim of tested Linux deployment.
 | `make` / `make all` | Build root `server`, `client`, `admin` |
 | `make test` / `make check` | Existing stable C, mock-TLS and production primary/read suites |
 | `make sanitize` | Same stable suites with ASan/UBSan |
-| `make test-two-node` | Separate distributed acceptance suite; currently exposes known failures |
+| `make test-two-node` | 23 production two-node scenarios |
 | `make sanitize-two-node` | Distributed suite with ASan/UBSan |
+| `make test-contract-boundaries` | 13 wire/filesystem/concurrency tests |
+| `make test-server-write-correctness` | Seven startup/write/fault groups |
+| `make acceptance` / `make acceptance-sanitize` | All four suites, normal / ASan/UBSan |
 | `make clean` | Remove generated binaries, object/dependency trees and debug bundles |
 | `make help` | Target summary |
 
@@ -92,7 +94,10 @@ DBs, temporary certificates/keys and PTY password input. Processes and temporary
 secrets are cleaned up after success or failure; passwords are redacted from
 failure reports. Reports include stdout/stderr and exit signals. Core dumps are
 disabled. Startup uses the flushed listener banner rather than a probe connection
-that could itself trigger the known replica crash.
+that would add a worker unrelated to the test scenario. Port reservations must
+be released before server bind; an occasional `Address already in use` during
+fixture startup is possible. Inspect the diagnostic and rerun the unchanged
+target after the port is released; do not count that failed run as a pass.
 
 `OPENSSL` overrides the harness CLI executable; Make otherwise uses
 `OPENSSL_PREFIX/bin/openssl` or `openssl` from PATH. Select one scenario after
@@ -103,10 +108,23 @@ python3 tests/test_two_node_integration.py ./server ./client ./admin --match tes
 python3 tests/test_two_node_integration.py ./build/sanitize/server ./build/sanitize/client ./build/sanitize/admin --match test_10
 ```
 
-Known defects are failures, not skips/xfails. Normal crash manifestations can vary;
-sanitizers expose the memory errors. This suite is **not part of `make test`**.
-Promote it only after acceptance criteria pass. Green normal tests do not prove
-replication: their production-write checks still cover the legacy one-status flow.
+The distributed, boundary and write-correctness suites remain independently
+runnable; `make test` alone does not include them. Full validation is available as:
+
+```sh
+make OPENSSL_PREFIX="$(brew --prefix openssl@3)" acceptance
+make OPENSSL_PREFIX="$(brew --prefix openssl@3)" acceptance-sanitize
+```
+
+These compose the existing targets without changing test instrumentation.
+The focused commands are:
+
+```sh
+make OPENSSL_PREFIX="$(brew --prefix openssl@3)" test-contract-boundaries
+make OPENSSL_PREFIX="$(brew --prefix openssl@3)" SANITIZE=1 test-contract-boundaries
+make OPENSSL_PREFIX="$(brew --prefix openssl@3)" test-server-write-correctness
+make OPENSSL_PREFIX="$(brew --prefix openssl@3)" SANITIZE=1 test-server-write-correctness
+```
 
 ## Client Usage
 
@@ -142,7 +160,6 @@ connecting. Remote filenames are 1–256 printable ASCII characters, excluding `
 ```sh
 ./client --config client.conf --username alice list
 ./client --config client.conf --username alice download hello.txt downloaded.txt
-# Intended write usage; currently blocked by server integration defects:
 ./client --config client.conf --username alice upload local.txt remote.txt
 ./client --config client.conf --username alice delete remote.txt
 ```
@@ -151,8 +168,7 @@ LIST prints one name per line. DOWNLOAD refuses an existing destination, stages
 privately, and publishes after receiving all advertised bytes; publication needs
 hard-link support. Handled failures remove staging; process crashes can leave a
 staging file. UPLOAD waits for preliminary OK before sending bytes and requires
-final OK. Zero-length transfers are supported by the client contract; production
-zero-byte UPLOAD is not currently working. Errors exit nonzero.
+final OK. Zero-length uploads and downloads are supported. Errors exit nonzero.
 
 Read failover occurs only for eligible transport failures **before any valid
 application status**. Certificate/identity failures, application errors, malformed
@@ -180,8 +196,8 @@ its default is `primary.localhost`, so set it explicitly. `--replication-port`
 (default 8081) is the destination port on primary and listening port on replica.
 The default role is primary. `--timeout` defaults to 15 seconds; it does not bound
 all outbound peer setup. Replica requires `--peer-cert`; primary currently does
-not. **Omitting it enables the known local-only write bypass; do not use omission
-as a distributed deployment configuration.** No explicit standalone option exists.
+not require it at startup, but writes fail closed without usable peer trust.
+There is no local-only write fallback or standalone mode.
 The server binds IPv4 listeners on all interfaces, even for a local demo.
 
 `--auth-db` is mandatory. Startup opens it read-only, runs SQLite `quick_check`
@@ -214,7 +230,7 @@ presents certificates and requires a peer certificate on the replica. It reuses
 `-c/-k` for both purposes and loads peer trust from `--peer-cert`. Outbound peer
 hostname/IP checks and SNI are absent; a broad CA trust file is not an intended-peer
 identity check. The local guide uses explicit self-signed peer certificates.
-Operational mTLS validation remains blocked by replication worker defects.
+Trusted and untrusted peer cases are covered by two-node acceptance.
 
 Password storage uses PBKDF2-HMAC-SHA256, 600,000 default iterations, 16-byte random
 salts and 32-byte derived keys, with stored KDF parameters and constant-time key
@@ -231,29 +247,42 @@ SAN/trust/client-purpose workflow used in the deployment guide and harness.
 
 ## Local Two-Node Demo
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for a reproducible temporary setup: build,
-provision both accounts/directories, generate test trust material, start replica
-then primary, create client config, seed/read files, and exercise read failover.
-Replicated UPLOAD/DELETE steps are explicitly gated on fixes; current replica
-lifecycle failures are expected reproductions, not successful demo outcomes.
+See [DEPLOYMENT.md](DEPLOYMENT.md) for a copyable temporary setup covering account
+provisioning, certificates, replicated upload, primary/replica reads, failover,
+coordinated delete and replica-outage rejection.
 
-## Known Issues / Work Remaining
+## Write consistency and boundaries
 
-Reproduce with `make test-two-node`; use `make sanitize-two-node` for memory diagnostics.
+Primary writes serialize by `(username, filename)`, including conflicting
+UPLOAD/DELETE operations. The lock spans coordinated completion and cleanup;
+unrelated users/files can proceed concurrently. Both nodes use exclusive short
+`.temp_` staging names, hidden from reads, and check local write/close failures.
+Writes require the replica; primary reads remain available during replica outage.
 
-- Replica client-worker cleanup can crash after a correct response (invalid free).
-- Replication worker alignment/ownership/socket lifetime defects can crash or reset
-  the peer connection before meaningful TLS/protocol validation.
-- UPLOAD never sends the preliminary status required by the client.
-- Missing primary peer configuration silently permits local-only writes.
-- Same-user/filename serialization is absent. Write containment, staging namespace,
-  path bounds, checked I/O and cleanup remain incomplete; peer framing/error
-  handling and setup deadlines also need correction.
+Wire limits are 64 username/password bytes and 256 filename bytes, plus a framing
+NUL. Exact limits parse without truncation; over-limit fields are rejected. Host
+`NAME_MAX` may be smaller (commonly 255): unsupported filenames fail cleanly and
+are never shortened. Use new remote names for uploads; see protocol caveats below.
 
-Commit acknowledgement loss may follow a local mutation; neither status 6 nor a
-connection error guarantees rollback. No crash reconciliation is implemented.
-Filesystem crash durability and recovery scope require agreement, not a claim of
-perfect distributed atomicity.
+## Known limitations
+
+- An error after the commit decision may mean the client cannot confirm the final
+  distributed outcome. There is no commit retry, persistent transaction journal,
+  automated reconciliation or full crash recovery. Writes do not fsync file and
+  directory state; power-loss durability is not guaranteed.
+- Outbound peer DNS/connect/TLS setup lacks a configured application deadline.
+  Peer TLS uses explicit peer-certificate trust, without outbound hostname/IP
+  verification or SNI. A broad CA is not equivalent to trusting only one peer.
+- Writes do not have the read handlers' full directory-relative no-follow
+  containment. Administrators must control storage ancestors and permissions.
+  Do not use remote names beginning `.temp_`; reads reserve that namespace, but
+  writes do not reject it. LIST is not a transactional snapshot.
+- Replica UPLOAD rejects an existing regular destination; primary rename can
+  replace a primary-only file if the nodes already diverged. This is not a general
+  overwrite or reconciliation API.
+- Peer fixed-width command/size reads assume complete fields in individual TLS
+  reads; some peer error paths append a dispatcher error. General fragmented-peer
+  robustness is not established by the current passing suites.
 
 ## Source and Integration Guide
 
@@ -262,7 +291,7 @@ perfect distributed atomicity.
 | `password_db.*`, `admin.c` | Credentials and local account administration |
 | `client*.c/.h`, `client.conf.example` | CLI, configuration, prompt, verified TLS, codec, commands and read failover |
 | `server.c/.h`, `server_ops.c`, `server_util.c` | Startup/roles, dispatch, primary writes and peer helpers |
-| `server_replication.c/.h` | Replica mTLS endpoint and partial transactions |
+| `server_replication.c/.h` | Replica mTLS endpoint and prepare/commit transactions |
 | `server_auth.*`, `server_read_ops.*` | Production authentication and safe local reads |
 | `server_protocol_io.*`, `server_protocol_fields.h` | TLS adapter, bounded fields and explicit statuses |
 | `protocol.h`, `protocol.md` | Constants and wire specification with implementation caveats |

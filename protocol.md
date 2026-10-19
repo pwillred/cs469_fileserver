@@ -1,7 +1,7 @@
 # Fileserver Wire Protocol
 
-This is the **working integration contract**, not a claim that all server paths
-pass acceptance. The merged client is the baseline for client-facing bytes and
+This is the frozen client-facing integration contract for the tested service.
+The merged client is the baseline for client-facing bytes and
 routing. Changes require coordination. See [README.md](README.md) for status,
 [INTEGRATION_ASSUMPTIONS.md](INTEGRATION_ASSUMPTIONS.md) for module interfaces, and
 [DEPLOYMENT.md](DEPLOYMENT.md) for local setup.
@@ -13,11 +13,9 @@ authentication/storage on either node; writes belong to primary. The replica has
 a separate mTLS endpoint for coordinated writes. Accounts are administered locally
 on each node, not replicated as files. Each client connection has its own thread.
 
-Implemented and tested: client codec/commands, TLS verification, read failover,
-credential storage, authentication and production reads. Role gates, peer mTLS and
-prepare/commit handlers exist but fail integration. Replica worker crashes,
-missing upload acceptance, implicit local-only writes and write-safety gaps are
-confirmed blockers. `make test-two-node` exposes these rather than masking them.
+Client commands, verified TLS, authentication, reads, read failover, role gates,
+mTLS and coordinated writes pass the normal and sanitizer acceptance suites.
+See the remaining limitations below; passing tests do not imply crash atomicity.
 
 ## 2. Common wire conventions
 
@@ -90,21 +88,16 @@ response 1:  preliminary status:u8
 response 2:  final status:u8
 ```
 
-**Required final behavior:** validate role, credentials, header/name/size and
-required peer readiness before acceptance. Final OK follows successful coordinated
-completion on both nodes. Zero-byte uploads still require both statuses. No
-additional byte or changed field order is introduced by this document.
+Primary validates credentials, header/name/size and local filename capacity, then
+sends preliminary OK before receiving payload. It stages locally and contacts the
+replica after receiving the payload. Preliminary OK does not promise peer
+availability or commit. Final OK follows local publication and replica commit
+confirmation. Zero-byte uploads still require both statuses. Missing peer trust
+or an unavailable replica fails closed; there is no local-only fallback.
 
-**Current deviation:** `handle_upload` opens staging and waits for payload without
-sending preliminary OK; dispatch sends only one status. Thus the actual client
-cannot complete the success flow. Peer connection occurs after receiving payload.
-If `--peer-cert` is absent, the handler commits locally. A zero-byte local upload
-can mutate storage while the client fails waiting for the second status.
-
-The earlier proposal's no-overwrite/EXISTS policy is not consistently enforced:
-primary may replace an existing destination, replica checks for a regular file
-before staging, and neither has same-name serialization. Confirm and implement
-one coordinated overwrite policy; this documentation pass does not change it.
+Replica rejects an existing regular destination with EXISTS. Primary publication
+uses rename, so a primary-only existing file can be replaced if the replica lacks
+it. Use fresh names; this is not a general overwrite/reconciliation guarantee.
 
 ### DELETE
 
@@ -113,19 +106,15 @@ request:  "DELETE" username\0 password\0 filename\0
 response: one final status:u8
 ```
 
-**Required final behavior:** authenticate, validate role/name/local existence,
-prepare the replica without deleting, decide commit, apply deletion and await
-replica completion before client OK. Failed prepare must preserve the local file.
-
-**Current state:** this ordering exists in the coordinator code but is blocked by
-replication endpoint/cleanup failures. Omitting `--peer-cert` takes a local-only
-path. A missing replica file is currently forwarded as NOT_FOUND; the intended
-divergence response is REPLICATION_FAILED, preserving the primary copy.
+Primary authenticates, validates the name and local existence, prepares the
+replica, unlinks locally, sends COMMIT and awaits confirmation before client OK.
+Missing local files return NOT_FOUND. A missing replica copy produces
+REPLICATION_FAILED and preserves the primary copy. Failed prepare does not delete
+locally. No write retry or failover occurs.
 
 ## 5. Peer protocol and transaction states
 
-These are the current code's protocol shape and intended execution, **not a verified
-working distributed transaction**. One outbound channel targets the configured
+These are the implemented peer message shapes. One outbound channel targets the configured
 replica per write. Authentication is by mTLS, so no password is in the peer header.
 
 ```text
@@ -152,15 +141,16 @@ Some error paths also append a dispatcher error, so peer response ownership need
 repair. There is **no commit retry** or multi-replica coordination in current code.
 
 The replica attempts to discard upload staging on pre-decision disconnect/timeout;
-a prepared DELETE has not yet unlinked anything. Cleanup is not complete on every
-path. Raw replica reads assume some fields arrive in one SSL_read and reject valid
-maximum-length strings; these are implementation defects, not new field limits.
+a prepared DELETE has not yet unlinked anything. Exact-maximum strings plus NUL
+are accepted without truncation; over-limit or
+unterminated fields fail. Fixed-width command/size reads still assume complete
+fields in individual SSL_read calls; arbitrary peer fragmentation is not covered.
 
 ## 6. Failure, concurrency and durability limits
 
-Required pre-commit rejection must not silently become local-only success. Current
-peer omission violates that requirement. With configured peer, failure paths
-attempt to return status 6, but unsafe cleanup can terminate connections/processes.
+Writes require replica participation. Missing peer configuration or unavailable
+replica produces REPLICATION_FAILED, without a local-only success path. Primary
+reads remain independent of replica availability.
 
 The coordinator commits locally before sending COMMIT/receiving confirmation. A
 peer failure or lost acknowledgement in that window can leave one node changed
@@ -169,27 +159,36 @@ and the other unchanged. Status 6 or connection loss therefore does **not** impl
 treats EXISTS/NOT_FOUND as successful retries. Manual inspection/reconciliation
 may be needed; no recovery log or automated reconciliation exists.
 
-Same-user/filename serialization is not implemented. Primary staging remains a
-fixed `.temp_` path; replica has randomized exclusive staging, but path containment,
-short-write handling and cleanup gaps remain. Rename publication alone does not
-prove correctness under these races. Primary fwrite/fclose results are unchecked.
-Neither write implementation fsyncs file/directory state, so “durable on both nodes”
-is not an established guarantee. Required crash-durability/recovery scope remains
-a team decision; this project does not claim perfect atomicity in every crash window.
+Primary serializes conflicting writes by `(username, filename)` through replication
+and cleanup; unrelated keys can run concurrently. Both nodes use exclusive
+`.temp_XXXXXX` staging within the user directory, independent of destination name
+length. Primary checks fwrite/ferror/fclose; replica handles short writes, EINTR,
+zero/error writes and close failure. Failed uploads remove staging before return.
+
+Wire filename capacity is 256 content bytes plus NUL. Local `NAME_MAX` may be 255
+or otherwise smaller. Write handlers check the directory's limit before use;
+unsupported UPLOAD names return INTERNAL, and DELETE returns NOT_FOUND for a name
+that cannot identify a local file. DOWNLOAD returns INTERNAL on an unsupported
+component. Full paths are bounded and rejected rather than truncated. No filesystem
+is assumed to support the entire wire filename range.
+
+Neither write implementation fsyncs file/directory state. There is no durable
+transaction journal or crash reconciliation. Storage ancestors remain trusted;
+write containment is less strict than directory-relative no-follow read access.
 
 ## 7. TLS, authentication and timeouts
 
 The client verifies CA/certificate trust plus DNS/IP identity and requires TLS 1.2
 or newer. Client requests carry credentials inside TLS. Replica client writes are
-rejected at the role gate before credential parsing. Both nodes otherwise verify
+rejected at the role gate without authentication, after bounded header parsing. Both nodes otherwise verify
 credentials against local read-only DB handles; accounts require manual provisioning.
 
 Replication uses separate TLS contexts/listener, reusing each node's `-c/-k`.
 Replica requires a peer certificate; both directions load trust from `--peer-cert`.
 Outbound peer hostname/IP verification and SNI are absent. Exact peer-certificate
 trust and broader CA trust have different identity implications; do not claim the
-latter restricts access to a designated host. Worker crashes currently prevent
-successful end-to-end mTLS acceptance validation.
+latter restricts access to a designated host. Trusted/untrusted peer cases pass
+end-to-end acceptance using explicit peer certificates.
 
 Credential storage is implemented PBKDF2-HMAC-SHA256: default 600,000 iterations,
 16-byte random salts, 32-byte derived keys and stored KDF parameters. Verification
@@ -218,11 +217,10 @@ invalid CA/config, TLS negotiation errors, malformed/unknown statuses and local
 errors do not trigger failover. A replica failure is final; there is no return to
 primary, general retry loop or backoff. UPLOAD/DELETE never retry or fail over.
 
-## 9. Remaining coordination decisions
+## 9. Scope of guarantees
 
-- Resolve remote overwrite policy consistently on both nodes.
-- Specify peer identity/trust policy for deployment beyond exact test certificates.
-- Define recovery/durability expectations after an ambiguous commit.
-
-The client-facing layouts and routing above remain fixed while these decisions
-and the documented implementation defects are addressed.
+The single-primary/single-replica design uses explicit peer trust and no automatic
+recovery or retries. Remote overwrite asymmetry, fragmented fixed-width peer
+reads and duplicate error bytes on some peer failure paths remain limitations;
+none changes the frozen client layouts. See [README.md](README.md) for the
+consolidated known-limitations list.

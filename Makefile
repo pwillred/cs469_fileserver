@@ -159,12 +159,16 @@ clean:
 
 help:
 	@echo 'make [all|server|client|admin]  Build programs (default: all three)'
-	@echo 'make test / check             Run all C and Python TLS/PTY suites'
+	@echo 'make test / check             Run stable C and Python TLS/PTY suites'
 	@echo 'make test-client-commands     Run command API and executable integration tests'
 	@echo 'make test-server-auth-faults  Run injected authentication failure mappings'
-	@echo 'make sanitize                 Run all suites in build/sanitize using ASan/UBSan'
+	@echo 'make sanitize                 Run stable suites using ASan/UBSan'
 	@echo 'make test-two-node            Run production two-process acceptance tests'
 	@echo 'make sanitize-two-node        Run two-process acceptance tests using ASan/UBSan'
+	@echo 'make test-contract-boundaries Run wire/filesystem boundary and cross-user tests'
+	@echo 'make test-server-write-correctness Run startup/concurrency/write fault tests'
+	@echo 'make acceptance              Run all four normal validation targets'
+	@echo 'make acceptance-sanitize     Run all four targets using ASan/UBSan'
 	@echo 'make clean                    Remove generated binaries, objects and build/'
 	@echo 'Optional: OPENSSL_PREFIX=... CC=... CFLAGS=... CPPFLAGS=... LDFLAGS=... PYTHON=python3'
 
@@ -188,3 +192,13 @@ test-server-write-correctness: $(SERVER) $(CLIENT) $(ADMIN) $(TEST_DIR)/server_w
 .PHONY: test-contract-boundaries
 test-contract-boundaries: $(SERVER) $(CLIENT) $(ADMIN)
 	OPENSSL="$(OPENSSL)" $(PYTHON) tests/test_contract_boundaries.py ./$(SERVER) ./$(CLIENT) ./$(ADMIN)
+
+# Sequential composition also avoids overlapping fixture builds under make -j.
+.PHONY: acceptance acceptance-sanitize
+acceptance:
+	$(MAKE) test
+	$(MAKE) test-two-node
+	$(MAKE) test-contract-boundaries
+	$(MAKE) test-server-write-correctness
+acceptance-sanitize:
+	$(MAKE) SANITIZE=1 acceptance
