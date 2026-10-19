@@ -176,7 +176,7 @@ error_code_t handle_upload(SSL* ssl, const server_config_t* config) {
     FILE *file = NULL;
     SSL *peer = NULL;
     err = ERR_INTERNAL;
-    if (!user_dir) goto done;
+    if (!user_dir || filename_fits_directory(user_dir, filename) != 0) goto done;
     int length = snprintf(temp_path, sizeof(temp_path), "%s/.temp_XXXXXX", user_dir);
     if (length < 0 || (size_t)length >= sizeof(temp_path)) goto done;
     length = snprintf(final_path, sizeof(final_path), "%s/%s", user_dir, filename);
@@ -255,6 +255,10 @@ error_code_t handle_delete(SSL* ssl, const server_config_t* config) {
     char file_path[512];
     err = ERR_INTERNAL;
     if (!user_dir) goto done;
+    if (filename_fits_directory(user_dir, filename) != 0) {
+        err = ERR_NOT_FOUND;
+        goto done;
+    }
     int length = snprintf(file_path, sizeof(file_path), "%s/%s", user_dir, filename);
     if (length < 0 || (size_t)length >= sizeof(file_path)) goto done;
     struct stat st;
