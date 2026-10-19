@@ -145,8 +145,7 @@ check: test
 sanitize:
 	$(MAKE) SANITIZE=1 test
 
-# Opt-in acceptance suite: known replication defects remain real failures.
-# Keep out of TEST_TARGETS until the distributed acceptance criteria pass.
+# Production two-node acceptance remains independently runnable.
 test-two-node: $(SERVER) $(CLIENT) $(ADMIN)
 	OPENSSL="$(OPENSSL)" $(PYTHON) tests/test_two_node_integration.py ./$(SERVER) ./$(CLIENT) ./$(ADMIN)
 sanitize-two-node:
@@ -164,7 +163,7 @@ help:
 	@echo 'make test-client-commands     Run command API and executable integration tests'
 	@echo 'make test-server-auth-faults  Run injected authentication failure mappings'
 	@echo 'make sanitize                 Run all suites in build/sanitize using ASan/UBSan'
-	@echo 'make test-two-node            Run opt-in two-process acceptance tests (currently failing)'
+	@echo 'make test-two-node            Run production two-process acceptance tests'
 	@echo 'make sanitize-two-node        Run two-process acceptance tests using ASan/UBSan'
 	@echo 'make clean                    Remove generated binaries, objects and build/'
 	@echo 'Optional: OPENSSL_PREFIX=... CC=... CFLAGS=... CPPFLAGS=... LDFLAGS=... PYTHON=python3'
@@ -185,3 +184,7 @@ $(TEST_DIR)/server_write_faults: $(filter-out $(BUILD_DIR)/server_ops.o $(BUILD_
 .PHONY: test-server-write-correctness
 test-server-write-correctness: $(SERVER) $(CLIENT) $(ADMIN) $(TEST_DIR)/server_write_faults
 	OPENSSL="$(OPENSSL)" $(PYTHON) tests/test_server_write_correctness.py ./$(SERVER) ./$(CLIENT) ./$(ADMIN) ./$(TEST_DIR)/server_write_faults
+
+.PHONY: test-contract-boundaries
+test-contract-boundaries: $(SERVER) $(CLIENT) $(ADMIN)
+	OPENSSL="$(OPENSSL)" $(PYTHON) tests/test_contract_boundaries.py ./$(SERVER) ./$(CLIENT) ./$(ADMIN)

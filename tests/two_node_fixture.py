@@ -169,9 +169,9 @@ class Node:
 def wait_for_port(node, ports, timeout=8):
     """Use the post-bind/listen banner, not a destructive TCP readiness probe.
 
-    Current replica cleanup crashes even after a probe. The production banner is
-    flushed only after all requested listeners are bound, so it is our readiness
-    barrier. Actual TCP/TLS connections are made by the test under examination.
+    The production banner is flushed after all requested listeners are bound.
+    Using it avoids introducing an extra worker into the scenario under test.
+    Actual TCP/TLS connections are made by the test under examination.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -223,7 +223,7 @@ class Pair:
             self.close()
             raise
 
-    def start(self, name, peer=True, allow_rejection=False):
+    def start(self, name, peer=True, allow_rejection=False, timeout=2):
         for key in ([name, 'replication'] if name == 'replica' else [name]):
             reservation = self.reservations.pop(key, None)
             if reservation:
@@ -233,7 +233,7 @@ class Pair:
                 '-k', str(directory / 'key.pem'), '-d', str(directory / 'data'),
                 '--auth-db', str(directory / 'users.db'), '--role', name,
                 '--replication-port', str(self.ports['replication']),
-                '--coordinator-name', '127.0.0.1', '--timeout', '2']
+                '--coordinator-name', '127.0.0.1', '--timeout', str(timeout)]
         if peer:
             other = 'replica' if name == 'primary' else 'primary'
             argv += ['--peer-cert', str(self.root / other / 'cert.pem')]
@@ -252,7 +252,7 @@ class Pair:
     def file(self, node, name='seed.bin'):
         return self.root / node / 'data' / USER / name
 
-    def client(self, args, direct='primary', password=PASSWORD):
+    def client(self, args, direct='primary', password=PASSWORD, username=USER):
         config = self.root / 'client.conf'
         # Direct replica tests use replica for both endpoints: no primary can mask
         # a failed replica request. Failover tests retain the normal topology.
@@ -260,7 +260,7 @@ class Pair:
                           f'replica_host=127.0.0.1\nreplica_port={self.ports["replica"]}\n'
                           f'ca_file={self.root / "trust.pem"}\n')
         result = run_password_program([self.client_binary, '--config', str(config),
-                                       '--username', USER, *map(str, args)], self.root,
+                                       '--username', username, *map(str, args)], self.root,
                                       [b'Password: '], password)
         self.events.append(f'client {args[0]} exit={result[0]} stdout={result[1]!r} stderr={result[2]!r}')
         return result
