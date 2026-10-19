@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in distributed acceptance tests. Known defects are failures, never xfails.
+"""Opt-in distributed acceptance tests against production binaries.
 
 Usage: python3 tests/test_two_node_integration.py SERVER CLIENT ADMIN [--match TEXT]
 Requires POSIX PTYs, loopback sockets and an OpenSSL CLI (override with OPENSSL).
@@ -297,7 +297,7 @@ def main():
         if not path.is_file() or not os.access(path, os.X_OK):
             parser.error(f'{name} executable not available: {path}')
         setattr(TwoNodeTests, 'client_binary' if name == 'client' else name, str(path))
-    # Crashes are expected findings; do not leave core files in fixture/repo dirs.
+    # Unexpected crashes must not leave core files in fixture/repo directories.
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     def interrupted(*_):
         raise KeyboardInterrupt

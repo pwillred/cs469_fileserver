@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Production executable tests; writes assert only the existing local behavior."""
+"""Production executable tests; writes verify missing-peer failure without publication."""
 import concurrent.futures
 import contextlib
 import os
@@ -196,11 +196,11 @@ with tempfile.TemporaryDirectory(prefix='cs469-production-') as directory:
         expect(port, request(user=b'u'*64, password=b'p'*64), b'\0\0\0\0\0')
         expect(port, request(user=b'u'*65), b'\4')
         expect(port, request(b'DELETE', name=b'absent'), b'\2', True)
-        # Local write regression only. No peer, commit or replicated-success claim.
+        # No-peer UPLOAD: preliminary OK, then replication failure; no publication.
         expect(port, request(b'UPLOAD', name=b'uploaded', size=4)+b'data', b'\0\6', True)
         check(not (data/'alice'/'uploaded').exists(), 'no local mutation on replication failure')
         expect(port, request(b'DELETE', name=b'uploaded'), b'\2')
-        check(not (data/'alice'/'uploaded').exists(), 'local delete regression')
+        check(not (data/'alice'/'uploaded').exists(), 'missing-file DELETE preserves storage')
 
         jobs = [(request(), listing), (request(b'DOWNLOAD'), download)]*6
         with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
@@ -237,4 +237,4 @@ with tempfile.TemporaryDirectory(prefix='cs469-production-') as directory:
     with server(empty_db) as (port, process):
         expect(port, request(), b'\1')
     print(f'PASS: {COUNT} production startup/wire checks; 5 actual client PTY cases; '
-          'legacy local-write framing, no preliminary OK, 12 concurrent reads and active-worker shutdown')
+          'preliminary OK then missing-peer rejection, 12 concurrent reads and listener shutdown')
